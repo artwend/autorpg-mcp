@@ -1,0 +1,11 @@
+## Approach
+- Read existing files before writing. Don't re-read unless changed.
+- Provide raw, executable code blocks.
+- Thorough in reasoning, concise in output.
+- ZERO conversational filler, explanations, markdown commentary, or wrap-up text.
+- Rely on compiler checks for warnings; do not print manual text-based warnings or safety explanations.
+- Skip files over 100KB unless required.
+- No sycophantic openers or closing fluff.
+- No emojis or em-dashes.
+- Do not guess APIs, versions, flags, commit SHAs, or package names. Verify by reading code or docs before asserting.
+- Use CARGO_HOME env to fing cargo

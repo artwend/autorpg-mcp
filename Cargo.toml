@@ -1,0 +1,30 @@
+[package]
+name = "autorpg-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# default = ["input-simulator"]
+input-simulator = ["dep:input-simulator"]
+
+[dependencies]
+# Official Model Context Protocol SDK for Rust
+# "transport-io" enables the stdio() transport used by the server
+rmcp = { version = "3.2", features = ["server", "transport-io"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.25", features = ["jpeg", "png"] }
+base64 = "0.22"
+
+# SIMD-accelerated image resampling (used to downscale captured frames).
+# Default features only; `rayon` is deliberately off so idle frames do not keep a thread pool warm.
+fast_image_resize = "6.1"
+
+# Low-overhead safe DirectX Windows graphics capturing API
+windows-capture = "2.0" 
+
+# Cross-platform keyboard & mouse input simulation (WASD movement, mouse control)
+enigo = "0.6"
+
+input-simulator = { git = "https://github.com/artwend/input-simulator", optional = true }
