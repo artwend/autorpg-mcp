@@ -40,11 +40,9 @@ pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
-pub struct UpdateMetricsArgs {
-    /// Current player HP evaluation
-    hp: i32,
-    /// Current zone location identifier
-    location: String,
+pub struct SetZoneArgs {
+    /// Name of the new zone or area (read from compass, minimap, or screen banner)
+    pub location: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -224,31 +222,30 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         };
 
         let metrics = telemetry;
+        let telemetry_text = format!(
+            "[HP: {}% | Stamina: {}% | Q: {} | R: {} | F: {} | Zone: {}]",
+            metrics.player_hp,
+            metrics.stamina,
+            Self::format_ability(metrics.q_ready),
+            Self::format_ability(metrics.r_ready),
+            Self::format_ability(metrics.f_ready),
+            if metrics.location.is_empty() {
+                "Unknown"
+            } else {
+                &metrics.location
+            }
+        );
+
         if timed_out {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Screen unchanged for the wait window. Telemetry: HP = {}%, Stamina = {}%, \
-                Abilities: Q = {}, R = {}, F = {}. \
-                No visible change detected; wait longer, take a different action, or call \
-                again with force=true to receive the current frame as an image.",
-                metrics.player_hp,
-                metrics.stamina,
-                Self::format_ability(metrics.q_ready),
-                Self::format_ability(metrics.r_ready),
-                Self::format_ability(metrics.f_ready)
+                "Screen unchanged. Telemetry: {telemetry_text}. \
+                Wait longer, take an action, or call with force=true for an image."
             ))]));
         }
 
         let img_base64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
         Ok(CallToolResult::success(vec![
-            ContentBlock::text(format!(
-                "Display frame captured. Server-side Telemetry: HP = {}%, Stamina = {}%, \
-                Abilities: Q = {}, R = {}, F = {}.",
-                metrics.player_hp,
-                metrics.stamina,
-                Self::format_ability(metrics.q_ready),
-                Self::format_ability(metrics.r_ready),
-                Self::format_ability(metrics.f_ready)
-            )),
+            ContentBlock::text(format!("Frame captured. Telemetry: {telemetry_text}")),
             ContentBlock::image(img_base64, "image/jpeg"),
         ]))
     }
@@ -258,20 +255,19 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         if ready { "READY" } else { "COOLDOWN" }
     }
 
-    /// Mutates variables and logs a state transition context record.
-    #[tool(description = "Mutates variables and logs a state transition context record.")]
-    async fn update_game_metrics(
+    /// Updates the active zone identifier when entering a new area.
+    #[tool(description = "Updates the active zone/area name when entering a new region.")]
+    async fn set_zone(
         &self,
-        Parameters(UpdateMetricsArgs { hp, location }): Parameters<UpdateMetricsArgs>,
+        Parameters(SetZoneArgs { location }): Parameters<SetZoneArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut session = self.session.write().await;
-        session.current_metrics.player_hp = hp;
         session.current_metrics.location = location.clone();
-        session.record_event(format!("State synchronized. Zone: {}", location));
+        session.record_event(format!("Zone updated: {location}"));
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            "In-memory metrics synced successfully.",
-        )]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "Active zone set to: {location}."
+        ))]))
     }
 
     /// Returns the current in-memory game metrics as JSON.

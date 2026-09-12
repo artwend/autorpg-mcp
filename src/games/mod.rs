@@ -19,6 +19,7 @@ impl Resolution {
 }
 
 pub trait GameProfile: Send + Sync {
+    #[allow(dead_code)]
     fn id(&self) -> &'static str;
 
     /// Reads live telemetry out of `pixels`, which is laid out for `resolution`.
