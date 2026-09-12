@@ -28,6 +28,14 @@ with_cursor = true
 # the vision model's token cost) at the price of fine visual detail.
 preview_edge = 1024
 
+# What to capture: the whole primary monitor ("monitor") or a single window whose
+# title matches window_name ("window").
+target = "monitor"
+
+# Title of the window to capture when target = "window". Exact titles win; otherwise
+# the first window whose title contains this text is used. Ignored for "monitor".
+window_name = ""
+
 [server]
 # Maximum duration for hold-style input operations, in milliseconds.
 max_hold_ms = 10000

@@ -158,14 +158,14 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         }
     }
 
-    /// Grabs a highly optimized frame of the primary monitor.
+    /// Grabs a highly optimized frame of the captured screen (monitor or window).
     ///
     /// If the screen has not visibly changed since the last capture, this blocks until it does
     /// (or until the configured wait timeout elapses), so a static screen never produces a
     /// redundant frame or a redundant model round trip. Pass `force: true` to skip the wait
     /// and always receive the latest frame as an image, which is the only way to inspect a
     /// screen that stays visually static (menus, dialogue, inventory screens).
-    #[tool(description = "Grabs a highly optimized frame of the primary monitor.")]
+    #[tool(description = "Grabs a highly optimized frame of the captured screen.")]
     async fn capture_screen(
         &self,
         Parameters(CaptureScreenArgs { force }): Parameters<CaptureScreenArgs>,
@@ -422,7 +422,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let input = Arc::clone(&self.input);
         let (target, native, final_position) =
             tokio::task::spawn_blocking(move || -> MouseMoveResult {
-                    let mut simulator = input.lock().map_err(|e| e.to_string())?;
+                let mut simulator = input.lock().map_err(|e| e.to_string())?;
 
                 // Absolute: image-space coordinates must be scaled up to native display
                 // pixels before the move. Relative: pass the raw delta through unscaled,
@@ -435,7 +435,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                     // coordinates must be scaled up to native display pixels before the
                     // move. With DPI awareness set the display dimensions are physical
                     // pixels, matching the captured frame.
-                    let (native_w, native_h) = simulator.main_display().map_err(|e| e.to_string())?;
+                    let (native_w, native_h) =
+                        simulator.main_display().map_err(|e| e.to_string())?;
                     let longest = native_w.max(native_h);
                     let scale = if longest as f64 > preview_edge {
                         longest as f64 / preview_edge
@@ -541,9 +542,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         }): Parameters<HoldMouseArgs>,
     ) -> Result<CallToolResult, McpError> {
         let button = parse_button(button.as_deref())?;
-        let action = action
-            .unwrap_or_else(|| "hold".to_string())
-            .to_lowercase();
+        let action = action.unwrap_or_else(|| "hold".to_string()).to_lowercase();
         let duration =
             Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
 
@@ -561,12 +560,12 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                         .button(button, Direction::Release)
                         .map_err(|e| e.to_string())
                 }
-                "press" => simulator.button(button, Direction::Press).map_err(|e| e.to_string()),
-                "release" => {
-                    simulator
-                        .button(button, Direction::Release)
-                        .map_err(|e| e.to_string())
-                }
+                "press" => simulator
+                    .button(button, Direction::Press)
+                    .map_err(|e| e.to_string()),
+                "release" => simulator
+                    .button(button, Direction::Release)
+                    .map_err(|e| e.to_string()),
                 _ => Err(format!(
                     "invalid action: {}. Use hold/press/release.",
                     action_task
@@ -627,9 +626,15 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     )]
     async fn wait(
         &self,
-        Parameters(WaitArgs { duration_ms, reason }): Parameters<WaitArgs>,
+        Parameters(WaitArgs {
+            duration_ms,
+            reason,
+        }): Parameters<WaitArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let duration = Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_wait_ms));
+        let duration = duration_ms
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(500))
+            .min(self.limits.max_wait());
 
         tokio::time::sleep(duration).await;
 
@@ -707,7 +712,10 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             }
             // Sleep until the next frame signal or the deadline, whichever comes first.
             // Frames arriving while the screen stays static simply re-run the check.
-            if tokio::time::timeout_at(deadline, notified.as_mut()).await.is_err() {
+            if tokio::time::timeout_at(deadline, notified.as_mut())
+                .await
+                .is_err()
+            {
                 return Ok(true);
             }
         }

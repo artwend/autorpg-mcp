@@ -1,4 +1,5 @@
-//! Windows Graphics Capture engine: streams the primary monitor into a shared RGB preview buffer.
+//! Windows Graphics Capture engine: streams the primary monitor (or the window
+//! named in the configuration) into a shared RGB preview buffer.
 
 use std::time::{Duration, Instant};
 

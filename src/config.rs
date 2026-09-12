@@ -44,8 +44,18 @@ impl Config {
     }
 }
 
+/// What part of the screen the capture engine records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureTarget {
+    /// The whole primary monitor (the default).
+    Monitor,
+    /// A single window, selected by title via [`CaptureConfig::window_name`].
+    Window,
+}
+
 /// Capture pipeline tuning.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
     /// Minimum time between two frames that are actually converted, in milliseconds.
@@ -70,6 +80,13 @@ pub struct CaptureConfig {
     /// against the same box. Lower values shrink every published frame's pixel count
     /// (and with it the vision model's token cost) at the price of fine visual detail.
     pub preview_edge: u32,
+
+    /// What to capture: the whole primary monitor or a single window.
+    pub target: CaptureTarget,
+
+    /// Title of the window to capture when `target = "window"`. Exact titles
+    /// win; otherwise the first window whose title contains this text is used.
+    pub window_name: String,
 }
 
 impl Default for CaptureConfig {
@@ -80,6 +97,8 @@ impl Default for CaptureConfig {
             jpeg_quality: 70,
             with_cursor: true,
             preview_edge: 1024,
+            target: CaptureTarget::Monitor,
+            window_name: String::new(),
         }
     }
 }
@@ -102,6 +121,15 @@ impl CaptureConfig {
     /// average-hash grid and the telemetry scans meaningful.
     pub fn sanitized_preview_edge(&self) -> u32 {
         self.preview_edge.max(64)
+    }
+
+    /// Title to match the captured window against when [`CaptureTarget::Window`]
+    /// is selected; `None` when capturing the whole monitor.
+    pub fn window_title(&self) -> Option<&str> {
+        match self.target {
+            CaptureTarget::Monitor => None,
+            CaptureTarget::Window => Some(self.window_name.as_str()),
+        }
     }
 }
 
@@ -249,6 +277,20 @@ mod tests {
         assert_eq!(config.capture.jpeg_quality, 40);
         assert_eq!(config.capture.frame_interval_ms, 200);
         assert_eq!(config.server.stale_hash_distance, 2);
+    }
+
+    #[test]
+    fn capture_target_parses() {
+        let config = Config::from_str("[capture]\ntarget = \"window\"\nwindow_name = \"Dark Souls\"\n").unwrap();
+        assert_eq!(config.capture.target, CaptureTarget::Window);
+        assert_eq!(config.capture.window_name, "Dark Souls");
+
+        let config = Config::from_str("[capture]\ntarget = \"monitor\"\n").unwrap();
+        assert_eq!(config.capture.target, CaptureTarget::Monitor);
+        assert_eq!(config.capture.window_title(), None);
+
+        let config = Config::from_str("").unwrap();
+        assert_eq!(config.capture.target, CaptureTarget::Monitor);
     }
 
     #[test]

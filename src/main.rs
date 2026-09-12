@@ -15,13 +15,14 @@ use log::info;
 use rmcp::ServiceExt;
 use tokio::sync::RwLock;
 use windows_capture::{
-    capture::GraphicsCaptureApiHandler,
+    capture::{CaptureControl, GraphicsCaptureApiHandler},
     graphics_capture_api::GraphicsCaptureApi,
     monitor::Monitor,
     settings::{
         ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
-        MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
+        GraphicsCaptureItemType, MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     },
+    window::Window,
 };
 
 use capture::{CaptureFlags, CaptureReceiver};
@@ -51,6 +52,76 @@ fn set_process_dpi_awareness() {
     let _ = unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     };
+}
+
+/// Builds the capture settings for `source` and starts the capture thread.
+///
+/// Generic over the source because the target is either a [`Monitor`] or a
+/// [`Window`], chosen at runtime. `GraphicsCaptureItemType` itself is not
+/// `Send` (its HWND fallback variant holds a raw pointer), so the two source
+/// types cannot be collapsed into it before `start_free_threaded`.
+fn start_capture<Source>(
+    source: Source,
+    cursor_settings: CursorCaptureSettings,
+    minimum_update_interval: MinimumUpdateIntervalSettings,
+    flags: CaptureFlags,
+) -> Result<
+    CaptureControl<CaptureReceiver, Box<dyn std::error::Error + Send + Sync>>,
+    Box<dyn std::error::Error>,
+>
+where
+    Source: TryInto<GraphicsCaptureItemType> + Send + 'static,
+{
+    let settings = Settings::new(
+        source,
+        cursor_settings,
+        DrawBorderSettings::Default,
+        SecondaryWindowSettings::Default,
+        minimum_update_interval,
+        DirtyRegionSettings::Default,
+        ColorFormat::Rgba8,
+        flags,
+    );
+    Ok(CaptureReceiver::start_free_threaded(settings)?)
+}
+
+/// Locates the window to capture by title.
+///
+/// Exact titles win; otherwise the first window whose title contains the text
+/// (case-insensitively) is used. Failures list the visible window titles so a
+/// typo in the configuration can be fixed on the spot.
+fn capture_window_by_title(title: &str) -> Result<Window, Box<dyn std::error::Error>> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("capture.target = \"window\" requires capture.window_name".into());
+    }
+
+    if let Ok(window) = Window::from_name(title) {
+        return Ok(window);
+    }
+
+    let lowercase_title = title.to_lowercase();
+    let mut matching: Option<Window> = None;
+    let mut titles: Vec<String> = Vec::new();
+    for window in Window::enumerate()? {
+        if let Ok(name) = window.title() {
+            if matching.is_none() && name.to_lowercase().contains(&lowercase_title) {
+                matching = Some(window);
+            }
+            titles.push(name);
+        }
+    }
+
+    matching.map_or_else(
+        || {
+            Err(format!(
+                "no window matching {title:?} (open windows: {})",
+                titles.join("; ")
+            )
+            .into())
+        },
+        Ok,
+    )
 }
 
 #[tokio::main]
@@ -136,29 +207,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         MinimumUpdateIntervalSettings::Default
     };
 
-    let primary_monitor = Monitor::primary()?;
     let cursor_settings = if config.capture.with_cursor {
         CursorCaptureSettings::WithCursor
     } else {
         CursorCaptureSettings::WithoutCursor
     };
-    let settings = Settings::new(
-        primary_monitor,
-        cursor_settings,
-        DrawBorderSettings::Default,
-        SecondaryWindowSettings::Default,
-        minimum_update_interval,
-        DirtyRegionSettings::Default,
-        ColorFormat::Rgba8,
-        CaptureFlags {
-            frame_buffer: frame_buffer.clone(),
-            frame_notify: frame_notify.clone(),
-            config: config.capture,
-        },
-    );
+    let capture_flags = CaptureFlags {
+        frame_buffer: frame_buffer.clone(),
+        frame_notify: frame_notify.clone(),
+        // `CaptureConfig` is no longer `Copy` (it carries the window title), so it
+        // is cloned out of `config` here while the rest of `main` keeps using it.
+        config: config.capture.clone(),
+    };
 
-    // Keep the capture control alive for the lifetime of the process
-    let _capture_control = CaptureReceiver::start_free_threaded(settings)?;
+    // Resolve the capture target: the whole primary monitor by default, or the window
+    // named in the configuration. `start_capture` is generic over the source, so a
+    // single call site fits either choice.
+    // Keep the capture control alive for the lifetime of the process.
+    let _capture_control = match config.capture.window_title() {
+        None => start_capture(
+            Monitor::primary()?,
+            cursor_settings,
+            minimum_update_interval,
+            capture_flags,
+        )?,
+        Some(title) => start_capture(
+            capture_window_by_title(title)?,
+            cursor_settings,
+            minimum_update_interval,
+            capture_flags,
+        )?,
+    };
 
     // Build the configured input backend (enigo by default, input-simulator
     // when the `input-simulator` feature is enabled)

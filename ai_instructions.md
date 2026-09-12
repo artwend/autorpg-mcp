@@ -7,8 +7,9 @@ Farm {target} continuously for {duration} minute(s).
 
 ## Telemetry
 `capture_screen` parses and persists HP, stamina, and weapon-ability readiness
-server-side on every call. The capture response text reports the current HP and
-stamina directly, so read them from there. Do NOT call `update_game_metrics`
+server-side on every call. The capture response text reports the current HP,
+stamina, and ability readiness (`Q`/`R`/`F` as READY or COOLDOWN) directly, so
+read them from there. Do NOT call `update_game_metrics`
 each iteration to sync HP or stamina; it is only for zone changes (see below).
 
 ## Loop
