@@ -23,6 +23,8 @@ pub struct Config {
     pub capture: CaptureConfig,
     /// MCP tool limits.
     pub server: ServerConfig,
+    /// Game profile layout tuning.
+    pub game: GameConfig,
     /// Prompt templates.
     pub prompts: PromptsConfig,
     /// Initial session state.
@@ -62,6 +64,12 @@ pub struct CaptureConfig {
 
     /// Whether the mouse cursor is drawn into captured frames.
     pub with_cursor: bool,
+
+    /// Longest edge of the published preview, in pixels. The captured frame is scaled
+    /// down to fit this edge (never upscaled), and game profiles author their UI layout
+    /// against the same box. Lower values shrink every published frame's pixel count
+    /// (and with it the vision model's token cost) at the price of fine visual detail.
+    pub preview_edge: u32,
 }
 
 impl Default for CaptureConfig {
@@ -71,6 +79,7 @@ impl Default for CaptureConfig {
             os_update_hint_ms: 150,
             jpeg_quality: 70,
             with_cursor: true,
+            preview_edge: 1024,
         }
     }
 }
@@ -87,6 +96,41 @@ impl CaptureConfig {
     /// JPEG quality clamped into the encoder's accepted 1-100 range.
     pub fn sanitized_jpeg_quality(&self) -> u8 {
         self.jpeg_quality.clamp(1, 100)
+    }
+
+    /// Preview longest edge clamped to a workable range: the lower bound keeps the
+    /// average-hash grid and the telemetry scans meaningful.
+    pub fn sanitized_preview_edge(&self) -> u32 {
+        self.preview_edge.max(64)
+    }
+}
+
+/// Game profile layout tuning.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GameConfig {
+    /// Aspect ratio (width / height) of the reference UI box game profiles author
+    /// their layout against. Should match the captured monitor's aspect ratio so
+    /// vertical coordinates land correctly.
+    pub reference_aspect_ratio: f32,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            reference_aspect_ratio: 16.0 / 9.0,
+        }
+    }
+}
+
+impl GameConfig {
+    /// Aspect ratio clamped into a sane range; non-finite values fall back to 16/9.
+    pub fn sanitized_reference_aspect_ratio(&self) -> f32 {
+        if self.reference_aspect_ratio.is_finite() {
+            self.reference_aspect_ratio.clamp(0.5, 8.0)
+        } else {
+            16.0 / 9.0
+        }
     }
 }
 
@@ -105,9 +149,6 @@ pub struct ServerConfig {
     /// How long `capture_screen` blocks waiting for the screen to change, in
     /// milliseconds, before giving up.
     pub wait_for_change_timeout_ms: u64,
-
-    /// How often the blocking wait re-checks the shared frame buffer, in milliseconds.
-    pub wait_poll_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -116,7 +157,6 @@ impl Default for ServerConfig {
             max_hold_ms: 10_000,
             stale_hash_distance: 2,
             wait_for_change_timeout_ms: 3_000,
-            wait_poll_interval_ms: 100,
         }
     }
 }
@@ -124,10 +164,6 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn wait_for_change_timeout(&self) -> Duration {
         Duration::from_millis(self.wait_for_change_timeout_ms)
-    }
-
-    pub fn wait_poll_interval(&self) -> Duration {
-        Duration::from_millis(self.wait_poll_interval_ms.max(1))
     }
 }
 
@@ -149,8 +185,6 @@ impl Default for PromptsConfig {
         }
     }
 }
-
-/// 
 
 /// Initial session state published before any tool call arrives.
 #[derive(Debug, Clone, Deserialize)]
@@ -194,6 +228,7 @@ mod tests {
     fn empty_file_yields_defaults() {
         let config = Config::from_str("").unwrap();
         assert_eq!(config.capture.frame_interval_ms, 200);
+        assert_eq!(config.capture.preview_edge, 1024);
         assert_eq!(config.server.max_hold_ms, 10_000);
         assert_eq!(config.session.initial_location, "Starter Village");
         assert_eq!(config.prompts.instructions_path, "ai_instructions.md");
@@ -222,11 +257,13 @@ mod tests {
             jpeg_quality = 85
             with_cursor = false
 
+            [game]
+            reference_aspect_ratio = 2.0
+
             [server]
             max_hold_ms = 5000
             stale_hash_distance = 4
             wait_for_change_timeout_ms = 1500
-            wait_poll_interval_ms = 50
 
             [prompts]
             instructions_path = "prompts/farm.md"
@@ -240,6 +277,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.capture.frame_interval(), Duration::from_millis(100));
         assert!(!config.capture.with_cursor);
+        assert_eq!(config.game.sanitized_reference_aspect_ratio(), 2.0);
         assert_eq!(config.server.wait_for_change_timeout(), Duration::from_millis(1500));
         assert_eq!(config.prompts.instructions_path, "prompts/farm.md");
         assert_eq!(config.session.initial_hp, 80);

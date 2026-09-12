@@ -1,7 +1,7 @@
 //! MCP server: application context, tool argument schemas and tool implementations.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine;
 use enigo::{Button, Coordinate, Direction, Keyboard, Mouse};
@@ -13,20 +13,27 @@ use rmcp::{
 };
 use serde::Deserialize;
 
-use crate::capture::PREVIEW_EDGE;
 use crate::config::ServerConfig;
 use crate::error::{input_error, internal_error, invalid_params};
 use crate::games::Resolution;
 use crate::input::{direction_scancode, key_scancode, ops};
-use crate::state::{SharedFrameBuffer, SharedSession};
+use crate::state::{SharedFrameBuffer, SharedFrameNotify, SharedSession};
 /// Application context shared by all MCP tools.
 #[derive(Clone)]
 pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     session: SharedSession,
     frame_buffer: SharedFrameBuffer,
+    /// Signalled by the capture thread after every published frame; lets the
+    /// wait-for-change loop sleep until a frame actually lands instead of polling.
+    frame_notify: SharedFrameNotify,
     input: Arc<Mutex<Input>>,
     /// Tool limits loaded from the configuration file.
     limits: ServerConfig,
+    /// Longest edge of the published preview, from the capture configuration; image-space
+    /// mouse coordinates are scaled up to native display pixels with it.
+    preview_edge: u32,
+    /// Quality of the on-demand JPEG encode, from the capture configuration.
+    jpeg_quality: u8,
     /// Path of the prompt instructions template, resolved against the configuration
     /// file's directory. Re-read on every prompt call so edits apply without a restart.
     instructions_path: std::path::PathBuf,
@@ -64,11 +71,14 @@ pub struct InputTextArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct MoveMouseArgs {
-    /// Target X coordinate in captured-frame (image) pixels; scaled to native display pixels
+    /// Target X coordinate in captured-frame (image) pixels; scaled to native display pixels.
+    /// Ignored for relative moves (raw delta in image pixels).
     x: i32,
-    /// Target Y coordinate in captured-frame (image) pixels; scaled to native display pixels
+    /// Target Y coordinate in captured-frame (image) pixels; scaled to native display pixels.
+    /// Ignored for relative moves (raw delta in image pixels).
     y: i32,
-    /// If true, the coordinates are relative to the current cursor position
+    /// If true, the coordinates are a raw delta applied to the current cursor position
+    /// (no scaling; for camera look, aiming and other mickey-based camera control)
     relative: Option<bool>,
 }
 
@@ -81,9 +91,28 @@ pub struct ClickMouseArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct HoldMouseArgs {
+    /// Mouse button to act on: "left" (default), "right" or "middle"
+    button: Option<String>,
+    /// What to do: "hold" (default: press, wait `duration_ms`, release), "press"
+    /// (keep the button held down) or "release" (release a held button)
+    action: Option<String>,
+    /// How long to hold the button in milliseconds for the "hold" action (default 50, max 10000)
+    duration_ms: Option<u64>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct ScrollMouseArgs {
     /// Scroll amount in wheel clicks; positive scrolls up, negative scrolls down
     amount: i32,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct CaptureScreenArgs {
+    /// When true, skip the wait-for-change window and return the latest frame immediately,
+    /// even if the screen has not visibly changed. Use this to inspect static screens
+    /// (menus, dialogue, inventory) that would otherwise time out without an image.
+    force: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -98,18 +127,25 @@ pub struct StartFarmArgs {
 
 #[tool_router]
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session: SharedSession,
         frame_buffer: SharedFrameBuffer,
+        frame_notify: SharedFrameNotify,
         input: Input,
         limits: ServerConfig,
+        preview_edge: u32,
+        jpeg_quality: u8,
         instructions_path: std::path::PathBuf,
     ) -> Self {
         Self {
             session,
             frame_buffer,
+            frame_notify,
             input: Arc::new(Mutex::new(input)),
             limits,
+            preview_edge,
+            jpeg_quality,
             instructions_path,
         }
     }
@@ -118,20 +154,27 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     ///
     /// If the screen has not visibly changed since the last capture, this blocks until it does
     /// (or until the configured wait timeout elapses), so a static screen never produces a
-    /// redundant frame or a redundant model round trip.
+    /// redundant frame or a redundant model round trip. Pass `force: true` to skip the wait
+    /// and always receive the latest frame as an image, which is the only way to inspect a
+    /// screen that stays visually static (menus, dialogue, inventory screens).
     #[tool(description = "Grabs a highly optimized frame of the primary monitor.")]
-    async fn capture_screen(&self) -> Result<CallToolResult, McpError> {
+    async fn capture_screen(
+        &self,
+        Parameters(CaptureScreenArgs { force }): Parameters<CaptureScreenArgs>,
+    ) -> Result<CallToolResult, McpError> {
         // Block until the screen changes; this is the server-side replacement for a "wait" tool.
-        let timed_out = self.wait_for_screen_change().await?;
+        // A forced capture skips the wait entirely and always returns an image.
+        let force = force.unwrap_or(false);
+        let timed_out = !force && self.wait_for_screen_change().await?;
 
         // Session lock first, frame lock second: the frame lock is a `std` mutex and must never
         // be held across the await below.
         let mut session = self.session.write().await;
 
         // Everything read out of the frame happens under one short critical section: sparse
-        // telemetry pixel samples and a copy of the (small) JPEG bytes. No image construction
-        // or base64 encoding runs under the lock, so the capture thread's `on_frame_arrived`
-        // is never blocked behind per-call image work.
+        // telemetry pixel samples and the on-demand JPEG encode. No base64 encoding runs
+        // under the lock, so the capture thread's `on_frame_arrived` is never blocked behind
+        // per-call image work.
         let (telemetry, jpeg) = {
             let guard = match self.frame_buffer.lock() {
                 Ok(lock) => lock,
@@ -156,18 +199,28 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             // Persist parsed telemetry so `get_game_metrics` and `record_event` snapshots
             // reflect the live frame instead of stale initialization data.
             session.current_metrics = metrics.clone();
-            session.last_frame_hash = Some(frame.hash);
+            // Only record the frame hash when the screen actually changed: overwriting it
+            // during a timed-out (static) check would make every subsequent call re-poll
+            // against the identical hash and time out forever until something else moves
+            // the display.
+            if !timed_out {
+                session.last_frame_hash = Some(frame.hash);
+            }
 
-            // The JPEG is copied out so the lock can be dropped before the (potentially
-            // slow) base64 encode below.
-            (metrics, frame.jpeg.clone())
+            // The JPEG is encoded on demand (the capture thread no longer pre-encodes) and
+            // handed out so the lock can be dropped before the base64 encode below.
+            let jpeg = frame
+                .encode_jpeg(self.jpeg_quality)
+                .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?;
+            (metrics, jpeg)
         };
 
         let metrics = telemetry;
         if timed_out {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "Screen unchanged for the wait window. Telemetry: HP = {}%, Stamina = {}%. \
-                No visible change detected; wait longer or take a different action.",
+                No visible change detected; wait longer, take a different action, or call \
+                again with force=true to receive the current frame as an image.",
                 metrics.player_hp, metrics.stamina
             ))]));
         }
@@ -204,8 +257,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     )]
     async fn get_game_metrics(&self) -> Result<CallToolResult, McpError> {
         let session = self.session.read().await;
-        let json =
-            serde_json::to_string_pretty(&session.current_metrics).map_err(internal_error)?;
+        let json = serde_json::to_string(&session.current_metrics).map_err(internal_error)?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
@@ -227,7 +279,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 direction
             ))
         })?;
-        let duration = Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_hold_ms));
+        let duration =
+            Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_hold_ms));
 
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -268,7 +321,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 key
             ))
         })?;
-        let duration = Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
+        let duration =
+            Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
 
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -319,81 +373,105 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
 
     /// Moves the mouse cursor to absolute (or relative) screen coordinates.
     ///
-    /// Coordinates are in the captured frame's image space (the preview scaled to
-    /// [`PREVIEW_EDGE`] on its longest edge) and are scaled up to native display pixels before
-    /// the move, so a position picked off the image lands on the same physical spot.
+    /// Absolute coordinates are in the captured frame's image space (the preview scaled to
+    /// the configured preview edge on its longest edge) and are scaled up to native display
+    /// pixels before the move, so a position picked off the image lands on the same
+    /// physical spot. The process runs with per-monitor DPI awareness, so the display
+    /// dimensions used for that scaling are physical pixels, matching what
+    /// windows-capture captures. Relative coordinates are raw mickey deltas passed
+    /// through unscaled: camera look operates on deltas, not image offsets.
     #[tool(
-        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or relative to its current position."
+        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or by a raw unscaled delta relative to its current position."
     )]
     async fn move_mouse(
         &self,
         Parameters(MoveMouseArgs { x, y, relative }): Parameters<MoveMouseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let coordinate = if relative.unwrap_or(false) {
+        let relative = relative.unwrap_or(false);
+        let coordinate = if relative {
             Coordinate::Rel
         } else {
             Coordinate::Abs
         };
         let (image_x, image_y) = (x, y);
 
+        let preview_edge = self.preview_edge as f64;
         let input = Arc::clone(&self.input);
-        let (x, y) = tokio::task::spawn_blocking(move || -> Result<(i32, i32), String> {
-            let mut simulator = input.lock().map_err(|e| e.to_string())?;
+        let (target, native, final_position) =
+            tokio::task::spawn_blocking(move || -> MouseMoveResult {
+                    let mut simulator = input.lock().map_err(|e| e.to_string())?;
 
-            // The capture pipeline publishes a preview scaled to PREVIEW_EDGE on its longest
-            // edge (never upscaled), so image-space coordinates must be scaled up to native
-            // display pixels before the move.
-            let (native_w, native_h) = simulator.main_display().map_err(|e| e.to_string())?;
-            let longest = native_w.max(native_h);
-            let scale = if longest > PREVIEW_EDGE as i32 {
-                longest as f64 / PREVIEW_EDGE as f64
-            } else {
-                1.0
-            };
-            let target_x = (x as f64 * scale).round() as i32;
-            let target_y = (y as f64 * scale).round() as i32;
+                // Absolute: image-space coordinates must be scaled up to native display
+                // pixels before the move. Relative: pass the raw delta through unscaled,
+                // since game cameras consume mickey deltas, not image-space offsets.
+                let (target_x, target_y, native) = if relative {
+                    (x, y, (0, 0))
+                } else {
+                    // The capture pipeline publishes a preview scaled to the configured
+                    // preview edge on its longest edge (never upscaled), so image-space
+                    // coordinates must be scaled up to native display pixels before the
+                    // move. With DPI awareness set the display dimensions are physical
+                    // pixels, matching the captured frame.
+                    let (native_w, native_h) = simulator.main_display().map_err(|e| e.to_string())?;
+                    let longest = native_w.max(native_h);
+                    let scale = if longest as f64 > preview_edge {
+                        longest as f64 / preview_edge
+                    } else {
+                        1.0
+                    };
+                    (
+                        (x as f64 * scale).round() as i32,
+                        (y as f64 * scale).round() as i32,
+                        (native_w, native_h),
+                    )
+                };
 
-            simulator
-                .move_mouse(target_x, target_y, coordinate)
-                .map_err(|e| e.to_string())?;
-            simulator.location().map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(input_error)?
-        .map_err(input_error)?;
+                simulator
+                    .move_mouse(target_x, target_y, coordinate)
+                    .map_err(|e| e.to_string())?;
+                let final_position = simulator.location().map_err(|e| e.to_string())?;
+                Ok(((target_x, target_y), native, final_position))
+            })
+            .await
+            .map_err(input_error)?
+            .map_err(input_error)?;
 
-        let message = format!(
-            "Mouse moved to image ({}, {}) -> native ({}, {}).",
-            image_x, image_y, x, y
-        );
+        let message = if relative {
+            format!(
+                "Mouse moved by relative delta ({}, {}); now at cursor ({}, {}).",
+                image_x, image_y, final_position.0, final_position.1
+            )
+        } else {
+            format!(
+                "Mouse moved to image ({}, {}) -> native ({}, {}) on a {}x{} display; \
+                 now at cursor ({}, {}).",
+                image_x,
+                image_y,
+                target.0,
+                target.1,
+                native.0,
+                native.1,
+                final_position.0,
+                final_position.1
+            )
+        };
         self.session.write().await.record_event(message.clone());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 
     /// Clicks a mouse button (left/right/middle, optional double click).
+    ///
+    /// For mechanics that need the button held (charging abilities, camera orbit
+    /// drag, inventory drag-and-drop), use `hold_mouse` instead.
     #[tool(
-        description = "Clicks a mouse button: left (default), right or middle; supports double click."
+        description = "Clicks a mouse button: left (default), right or middle; supports double click. For button holds and drags use hold_mouse."
     )]
     async fn click_mouse(
         &self,
         Parameters(ClickMouseArgs { button, double }): Parameters<ClickMouseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let button = match button
-            .unwrap_or_else(|| "left".to_string())
-            .to_lowercase()
-            .as_str()
-        {
-            "left" => Button::Left,
-            "right" => Button::Right,
-            "middle" => Button::Middle,
-            other => {
-                return Err(invalid_params(format!(
-                    "Invalid button: {}. Use left/right/middle.",
-                    other
-                )));
-            }
-        };
+        let button = parse_button(button.as_deref())?;
         let double = double.unwrap_or(false);
 
         let input = Arc::clone(&self.input);
@@ -419,6 +497,71 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             if double { "Double" } else { "Single" },
             button
         );
+        self.session.write().await.record_event(message.clone());
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+    }
+
+    /// Holds, presses or releases a mouse button.
+    ///
+    /// "hold" keeps the button down for `duration_ms` (charge-and-release).
+    /// "press"/"release" bracket a drag: press, `move_mouse` while held, release.
+    #[tool(
+        description = "Mouse button press-and-hold: action 'hold' (default) presses, waits duration_ms and releases; 'press' keeps the button down and 'release' releases it, so press + move_mouse + release performs a drag or camera orbit. Buttons: left (default), right or middle."
+    )]
+    async fn hold_mouse(
+        &self,
+        Parameters(HoldMouseArgs {
+            button,
+            action,
+            duration_ms,
+        }): Parameters<HoldMouseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let button = parse_button(button.as_deref())?;
+        let action = action
+            .unwrap_or_else(|| "hold".to_string())
+            .to_lowercase();
+        let duration =
+            Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
+
+        let input = Arc::clone(&self.input);
+        let action_task = action.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut simulator = input.lock().map_err(|e| e.to_string())?;
+            match action_task.as_str() {
+                "hold" => {
+                    simulator
+                        .button(button, Direction::Press)
+                        .map_err(|e| e.to_string())?;
+                    std::thread::sleep(duration);
+                    simulator
+                        .button(button, Direction::Release)
+                        .map_err(|e| e.to_string())
+                }
+                "press" => simulator.button(button, Direction::Press).map_err(|e| e.to_string()),
+                "release" => {
+                    simulator
+                        .button(button, Direction::Release)
+                        .map_err(|e| e.to_string())
+                }
+                _ => Err(format!(
+                    "invalid action: {}. Use hold/press/release.",
+                    action_task
+                )),
+            }
+        })
+        .await
+        .map_err(input_error)?
+        .map_err(input_error)?;
+
+        let message = match action.as_str() {
+            "hold" => format!(
+                "Held {:?} mouse button for {} ms, then released.",
+                button,
+                duration.as_millis()
+            ),
+            other => format!("Mouse button {:?} {}ed.", button, other),
+        };
         self.session.write().await.record_event(message.clone());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
@@ -452,16 +595,44 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     }
 }
 
+/// Parses a tool's button name argument into the enigo `Button`.
+fn parse_button(button: Option<&str>) -> Result<Button, McpError> {
+    match button.unwrap_or("left").to_lowercase().as_str() {
+        "left" => Ok(Button::Left),
+        "right" => Ok(Button::Right),
+        "middle" => Ok(Button::Middle),
+        other => Err(invalid_params(format!(
+            "Invalid button: {}. Use left/right/middle.",
+            other
+        ))),
+    }
+}
+
+/// Spawn-blocking result of a mouse move: `(target, native display size, cursor
+/// position after the move)`.
+type MouseMoveResult = Result<((i32, i32), (i32, i32), (i32, i32)), String>;
+
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
-    /// Polls the shared frame buffer until the screen visibly changes or the wait times out.
+    /// Waits until the screen visibly changes or the wait times out.
     ///
     /// Returns `true` if the wait timed out with the screen still static.
+    ///
+    /// Event-driven: the capture thread signals [`Self::frame_notify`] after every
+    /// published frame, so this parks on `Notified` instead of re-polling the buffer on
+    /// an interval. Each iteration registers its `Notified` future *before* re-checking
+    /// the buffer, which closes the lost-wakeup race between the check and the park.
     ///
     /// Lock discipline: session lock first, frame lock second, and neither is ever held
     /// across an await.
     async fn wait_for_screen_change(&self) -> Result<bool, McpError> {
-        let deadline = Instant::now() + self.limits.wait_for_change_timeout();
+        let deadline = tokio::time::Instant::now() + self.limits.wait_for_change_timeout();
         loop {
+            // Register interest in the next frame signal before inspecting the buffer: a
+            // frame published between the check and the await still completes the future.
+            let notified = self.frame_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let changed = {
                 let session = self.session.read().await;
                 let last_hash = session.last_frame_hash;
@@ -470,7 +641,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 match guard.as_ref() {
-                    // No buffer published yet; keep polling.
+                    // No buffer published yet; keep waiting.
                     None => false,
                     Some(frame) => last_hash.is_none_or(|last| {
                         calculate_hamming_distance(frame.hash, last)
@@ -481,10 +652,14 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             if changed {
                 return Ok(false);
             }
-            if Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Ok(true);
             }
-            tokio::time::sleep(self.limits.wait_poll_interval()).await;
+            // Sleep until the next frame signal or the deadline, whichever comes first.
+            // Frames arriving while the screen stays static simply re-run the check.
+            if tokio::time::timeout_at(deadline, notified.as_mut()).await.is_err() {
+                return Ok(true);
+            }
         }
     }
 }

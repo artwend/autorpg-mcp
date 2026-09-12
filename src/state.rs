@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
+
+use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
 
 use crate::games::GameProfile;
 
@@ -67,14 +69,13 @@ pub type SharedSession = Arc<RwLock<SessionState>>;
 
 /// Latest captured frame shared between the capture thread and the MCP tools.
 ///
-/// The preview pixels travel next to the JPEG so the tools can read telemetry straight out
-/// of the frame the capture thread already decoded once, instead of decompressing the JPEG
-/// again on every call.
+/// The preview pixels travel with their hash so the tools can read telemetry straight out
+/// of the frame the capture thread already produced once, instead of re-encoding or
+/// re-decoding anything on every call. JPEG encoding is deferred to the consumer: the
+/// capture thread never pays for it while no MCP client is querying frames.
 #[derive(Default, Debug)]
 pub struct FramePayload {
-    /// JPEG encoding of the preview, returned verbatim to the MCP client.
-    pub jpeg: Vec<u8>,
-    /// Tightly packed RGB8 pixels of that same preview.
+    /// Tightly packed RGB8 pixels of the preview.
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -87,9 +88,24 @@ impl FramePayload {
     ///
     /// Telemetry only samples a sparse subset of pixels, so it reads straight out of the
     /// shared buffer instead of materializing a full `DynamicImage` copy (which cost a
-    /// fresh ~1.7 MB allocation per call at the 1024x576 preview size).
+    /// fresh ~1.7 MB allocation per call at the default 1024x576 preview size).
     pub fn as_rgb_view(&self) -> Option<RgbView<'_>> {
         RgbView::new(&self.rgb, self.width, self.height)
+    }
+
+    /// Encodes the preview pixels into a freshly allocated JPEG buffer.
+    ///
+    /// Called only when a consumer actually requests an image, so the per-call cost is
+    /// paid once per served capture instead of continuously at the capture frame rate.
+    pub fn encode_jpeg(&self, quality: u8) -> Result<Vec<u8>, image::ImageError> {
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, quality.clamp(1, 100)).encode(
+            &self.rgb,
+            self.width,
+            self.height,
+            ExtendedColorType::Rgb8,
+        )?;
+        Ok(jpeg)
     }
 }
 
@@ -148,6 +164,12 @@ impl RgbView<'_> {
 
 /// Thread-safe pointer to the latest captured frame.
 pub type SharedFrameBuffer = Arc<Mutex<Option<FramePayload>>>;
+
+/// Event signal fired by the capture thread after every published frame.
+///
+/// Consumers awaiting a visible screen change park on this instead of re-polling the
+/// frame buffer on an interval, so a new frame wakes them the moment it lands.
+pub type SharedFrameNotify = Arc<Notify>;
 
 /// Current UNIX timestamp in seconds (0 if the clock is before the epoch).
 pub fn unix_timestamp() -> u64 {

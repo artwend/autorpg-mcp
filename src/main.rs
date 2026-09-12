@@ -27,10 +27,36 @@ use windows_capture::{
 use capture::{CaptureFlags, CaptureReceiver};
 use config::{Config, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH};
 use server::GameServer;
-use state::{GameMetrics, SessionState, SharedFrameBuffer};
+use state::{GameMetrics, SessionState, SharedFrameBuffer, SharedFrameNotify};
+
+// Per-monitor-v2 DPI awareness so `GetSystemMetrics` (and therefore the input
+// backend's `main_display`) reports physical monitor pixels instead of
+// DPI-virtualized ones: windows-capture always captures physical pixels, so
+// mouse coordinate scaling in `move_mouse` would drift on displays with
+// Windows scaling > 100% without this. Must run before any DPI-dependent API
+// is used.
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+}
+
+/// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (documented as -4).
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+
+/// Declares per-monitor-v2 DPI awareness for this process. Idempotent: the
+/// Windows call fails harmlessly when awareness was already set.
+fn set_process_dpi_awareness() {
+    // The return value is only an error when awareness was already set (e.g. by
+    // a manifest), in which case nothing needs to change.
+    let _ = unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    set_process_dpi_awareness();
+
     // Load the configuration file. An explicit CLI argument or the AUTORPG_MCP_CONFIG
     // environment variable must point at an existing file; the default path is optional
     // and simply falls back to the built-in defaults when absent.
@@ -82,14 +108,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             location: config.session.initial_location.clone(),
             in_combat: false,
         },
-        active_game: Arc::new(games::action_rpg::ActionRPG),
+        active_game: Arc::new(games::action_rpg::ActionRPG::new(
+            config.capture.sanitized_preview_edge(),
+            config.game.sanitized_reference_aspect_ratio(),
+        )),
         last_frame_hash: None,
         event_history: std::collections::VecDeque::new(),
     })
     .into();
 
-    // Shared buffer for the latest compressed screenshot
+    // Shared buffer for the latest compressed screenshot, plus the signal the capture
+    // thread fires after every published frame so waiters wake immediately.
     let frame_buffer: SharedFrameBuffer = Default::default();
+    let frame_notify: SharedFrameNotify = Default::default();
 
     // Start the Windows Graphics Capture session on a dedicated background thread.
     //
@@ -121,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ColorFormat::Rgba8,
         CaptureFlags {
             frame_buffer: frame_buffer.clone(),
+            frame_notify: frame_notify.clone(),
             config: config.capture,
         },
     );
@@ -136,8 +168,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = GameServer::new(
         session_state,
         frame_buffer,
+        frame_notify,
         input,
         config.server,
+        config.capture.sanitized_preview_edge(),
+        config.capture.sanitized_jpeg_quality(),
         instructions_path,
     );
     let service = server.serve(rmcp::transport::stdio()).await?;

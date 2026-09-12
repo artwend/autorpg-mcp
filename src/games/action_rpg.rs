@@ -1,28 +1,29 @@
 // src/games/action_rpg.rs
 
 use super::{GameProfile, Resolution};
-use crate::capture::PREVIEW_EDGE;
 use crate::state::{GameMetrics, RgbPixel, RgbView};
 
-/// Telemetry is always read from the capture engine's preview, whose longest edge never
-/// exceeds [`PREVIEW_EDGE`], so the UI layout is authored against that preview box instead
-/// of the desktop resolution it was captured from. Frames below the preview ceiling are
-/// still scaled proportionally by the [`Resolution`] handed to the parser.
-const REFERENCE_WIDTH: f32 = PREVIEW_EDGE as f32;
-const REFERENCE_HEIGHT: f32 = REFERENCE_WIDTH * 9.0 / 16.0;
+/// Reference box defaults matching the pre-configuration build: a 1024-edge preview with
+/// a 16:9 layout.
+const DEFAULT_PREVIEW_EDGE: u32 = 1024;
+const DEFAULT_REFERENCE_ASPECT_RATIO: f32 = 16.0 / 9.0;
 
-/// Health/stamina bar horizontal extent, rescaled from the 1920-wide layout it was measured on.
-const BAR_LEFT: f32 = REFERENCE_WIDTH * (760.0 / 1920.0);
-const BAR_RIGHT: f32 = REFERENCE_WIDTH * (1160.0 / 1920.0);
+/// Size of the 1920x1080 UI the layout constants below were measured on.
+const DESIGN_WIDTH: f32 = 1920.0;
+const DESIGN_HEIGHT: f32 = 1080.0;
 
-/// Vertical center of the health and stamina bars.
-const HEALTH_BAR_Y: f32 = REFERENCE_HEIGHT * (960.0 / 1080.0);
-const STAMINA_BAR_Y: f32 = REFERENCE_HEIGHT * (952.0 / 1080.0);
+/// Health/stamina bar horizontal extent, in 1920x1080 design pixels.
+const BAR_LEFT: f32 = 760.0;
+const BAR_RIGHT: f32 = 1160.0;
 
-/// Weapon ability icons along the bottom right.
-const Q_ICON_X: f32 = REFERENCE_WIDTH * (1685.0 / 1920.0);
-const R_ICON_X: f32 = REFERENCE_WIDTH * (1745.0 / 1920.0);
-const F_ICON_X: f32 = REFERENCE_WIDTH * (1805.0 / 1920.0);
+/// Vertical center of the health and stamina bars, in 1920x1080 design pixels.
+const HEALTH_BAR_Y: f32 = 960.0;
+const STAMINA_BAR_Y: f32 = 952.0;
+
+/// Weapon ability icons along the bottom right, in 1920x1080 design pixels.
+const Q_ICON_X: f32 = 1685.0;
+const R_ICON_X: f32 = 1745.0;
+const F_ICON_X: f32 = 1805.0;
 
 /// Relative luminance above which a weapon-ability icon counts as off cooldown.
 const ABILITY_READY_LUMINANCE: f32 = 65.0;
@@ -30,22 +31,76 @@ const ABILITY_READY_LUMINANCE: f32 = 65.0;
 /// Telemetry returned when a bar cannot be measured (no readable pixels).
 const UNKNOWN_PERCENT: i32 = 100;
 
-pub struct ActionRPG;
+/// Action RPG telemetry profile.
+///
+/// Telemetry is always read from the capture engine's preview, whose longest edge is the
+/// configured `preview_edge`, so the UI layout is authored against that preview box
+/// instead of the desktop resolution it was captured from. The box's aspect ratio comes
+/// from `[game] reference_aspect_ratio`; both are injected at construction and the layout
+/// below is rescaled from the 1920x1080 UI it was measured on into that reference box.
+/// Frames below the preview ceiling are still scaled proportionally by the [`Resolution`]
+/// handed to the parser.
+pub struct ActionRPG {
+    /// Reference box the layout coordinates are mapped through.
+    reference: Resolution,
+    /// Layout positions rescaled into the reference box.
+    bar_left: u32,
+    bar_right: u32,
+    health_bar_y: u32,
+    stamina_bar_y: u32,
+    q_icon_x: u32,
+    r_icon_x: u32,
+    f_icon_x: u32,
+}
+
+impl Default for ActionRPG {
+    fn default() -> Self {
+        Self::new(DEFAULT_PREVIEW_EDGE, DEFAULT_REFERENCE_ASPECT_RATIO)
+    }
+}
 
 impl ActionRPG {
+    /// Builds a profile whose reference box is `preview_edge` pixels wide with
+    /// `reference_aspect_ratio` (width / height) aspect. Degenerate values fall back to
+    /// the defaults above.
+    pub fn new(preview_edge: u32, reference_aspect_ratio: f32) -> Self {
+        let aspect = if reference_aspect_ratio.is_finite() && reference_aspect_ratio > 0.0 {
+            reference_aspect_ratio
+        } else {
+            DEFAULT_REFERENCE_ASPECT_RATIO
+        };
+        let width = preview_edge.max(1);
+        let height = ((width as f32 / aspect).round() as u32).max(1);
+        let reference = Resolution::new(width, height);
+
+        // Rescale the 1920x1080-measured layout into the reference box.
+        let fx = |x: f32| (x * width as f32 / DESIGN_WIDTH).round() as u32;
+        let fy = |y: f32| (y * height as f32 / DESIGN_HEIGHT).round() as u32;
+        Self {
+            reference,
+            bar_left: fx(BAR_LEFT),
+            bar_right: fx(BAR_RIGHT),
+            health_bar_y: fy(HEALTH_BAR_Y),
+            stamina_bar_y: fy(STAMINA_BAR_Y),
+            q_icon_x: fx(Q_ICON_X),
+            r_icon_x: fx(R_ICON_X),
+            f_icon_x: fx(F_ICON_X),
+        }
+    }
+
     /// Internal pixel helper to evaluate relative luminance (perceived human brightness).
     fn calculate_luminance(r: f32, g: f32, b: f32) -> f32 {
         0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 
-    /// Maps an x coordinate authored at [`REFERENCE_WIDTH`] onto `resolution`.
-    fn scale_x(design_x: f32, resolution: Resolution) -> u32 {
-        (design_x * resolution.width as f32 / REFERENCE_WIDTH).round() as u32
+    /// Maps an x coordinate authored at `self.reference.width` onto `resolution`.
+    fn scale_x(&self, reference_x: u32, resolution: Resolution) -> u32 {
+        (reference_x as f32 * resolution.width as f32 / self.reference.width as f32).round() as u32
     }
 
-    /// Maps a y coordinate authored at [`REFERENCE_HEIGHT`] onto `resolution`.
-    fn scale_y(design_y: f32, resolution: Resolution) -> u32 {
-        (design_y * resolution.height as f32 / REFERENCE_HEIGHT).round() as u32
+    /// Maps a y coordinate authored at `self.reference.height` onto `resolution`.
+    fn scale_y(&self, reference_y: u32, resolution: Resolution) -> u32 {
+        (reference_y as f32 * resolution.height as f32 / self.reference.height as f32).round() as u32
     }
 
     /// Internal pixel helper to scan horizontal bar segments.
@@ -98,26 +153,26 @@ impl GameProfile for ActionRPG {
         // 1. Scan Health Bar (Bottom center, deep saturated red)
         let hp_percent = Self::scan_horizontal_bar(
             pixels,
-            Self::scale_x(BAR_LEFT, resolution),
-            Self::scale_x(BAR_RIGHT, resolution),
-            Self::scale_y(HEALTH_BAR_Y, resolution),
+            self.scale_x(self.bar_left, resolution),
+            self.scale_x(self.bar_right, resolution),
+            self.scale_y(self.health_bar_y, resolution),
             |p| p.r > 150 && p.g < 60 && p.b < 60,
         );
 
         // 2. Scan Stamina Bar (Directly above HP bar, bright white/light-cyan hue)
         let stamina_percent = Self::scan_horizontal_bar(
             pixels,
-            Self::scale_x(BAR_LEFT, resolution),
-            Self::scale_x(BAR_RIGHT, resolution),
-            Self::scale_y(STAMINA_BAR_Y, resolution),
+            self.scale_x(self.bar_left, resolution),
+            self.scale_x(self.bar_right, resolution),
+            self.scale_y(self.stamina_bar_y, resolution),
             |p| p.r > 200 && p.g > 200 && p.b > 200,
         );
 
         // 3. Scan Skill Cooldown Pixels (Bottom-right weapon ability icons)
-        let ability_y = Self::scale_y(HEALTH_BAR_Y, resolution);
-        let q_ready = Self::is_ability_ready(pixels, Self::scale_x(Q_ICON_X, resolution), ability_y);
-        let r_ready = Self::is_ability_ready(pixels, Self::scale_x(R_ICON_X, resolution), ability_y);
-        let f_ready = Self::is_ability_ready(pixels, Self::scale_x(F_ICON_X, resolution), ability_y);
+        let ability_y = self.scale_y(self.health_bar_y, resolution);
+        let q_ready = Self::is_ability_ready(pixels, self.scale_x(self.q_icon_x, resolution), ability_y);
+        let r_ready = Self::is_ability_ready(pixels, self.scale_x(self.r_icon_x, resolution), ability_y);
+        let f_ready = Self::is_ability_ready(pixels, self.scale_x(self.f_icon_x, resolution), ability_y);
 
         GameMetrics {
             player_hp: hp_percent,

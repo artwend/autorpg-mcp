@@ -1,4 +1,4 @@
-//! Windows Graphics Capture engine: streams the primary monitor into a shared JPEG buffer.
+//! Windows Graphics Capture engine: streams the primary monitor into a shared RGB preview buffer.
 
 use std::time::{Duration, Instant};
 
@@ -6,7 +6,6 @@ use fast_image_resize::{
     FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
     images::{Image, ImageRef},
 };
-use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
 use log::warn;
 use windows_capture::{
     capture::{Context, GraphicsCaptureApiHandler},
@@ -16,19 +15,16 @@ use windows_capture::{
 };
 
 use crate::config::CaptureConfig;
-use crate::state::{FramePayload, SharedFrameBuffer};
-
-/// Longest edge of the published preview, in pixels.
-///
-/// This is also the reference box game profiles author their UI layout against, so it is
-/// exported to them rather than duplicated.
-pub(crate) const PREVIEW_EDGE: u32 = 1024;
+use crate::state::{FramePayload, SharedFrameBuffer, SharedFrameNotify};
 
 /// Everything the capture thread needs from the outside world, passed to the handler
 /// through the `Flags` mechanism.
 pub struct CaptureFlags {
     /// Shared buffer the converted frames are published into.
     pub frame_buffer: SharedFrameBuffer,
+    /// Signalled after every published frame so waiting consumers wake immediately
+    /// instead of polling the buffer.
+    pub frame_notify: SharedFrameNotify,
     /// Pacing and encoding settings.
     pub config: CaptureConfig,
 }
@@ -39,7 +35,7 @@ pub struct CaptureFlags {
 /// convolution is cheap enough at the handful of frames per second published here. Swap in
 /// [`FilterType::Hamming`] (downscaling quality close to bicubic at bilinear speed) or
 /// [`FilterType::Bilinear`] to trade quality for speed.
-const RESIZE_ALGORITHM: ResizeAlg = ResizeAlg::Convolution(FilterType::Lanczos3);
+const RESIZE_ALGORITHM: ResizeAlg = ResizeAlg::Convolution(FilterType::Hamming);
 
 /// Grid resolution of the published frame hash: an 8x8 grid yields its 64 bits.
 const HASH_GRID: u32 = 8;
@@ -57,25 +53,24 @@ const HASH_SAMPLES: u32 = 4;
 /// once.
 pub struct CaptureReceiver {
     frame_buffer: SharedFrameBuffer,
+    /// Signalled after every published frame; see [`CaptureFlags::frame_notify`].
+    frame_notify: SharedFrameNotify,
     /// Scratch space used to strip row padding out of the mapped GPU texture.
     depad_scratch: Vec<u8>,
     /// Destination of the downsample, still in the source's RGBA layout.
     preview_rgba: Vec<u8>,
-    /// Scratch space for the packed RGB preview handed to the JPEG encoder.
-    ///
-    /// Also the pixels published to consumers, hence their own buffer rather than a
-    /// transient used only inside the encode step.
+    /// Packed RGB preview pixels published to consumers. JPEG encoding is deferred to
+    /// the consumer (`GameServer::capture_screen`), so no encode work happens here while
+    /// no MCP client is querying frames.
     rgb_scratch: Vec<u8>,
-    /// Scratch space for the encoded JPEG that is published to `frame_buffer`.
-    jpeg_scratch: Vec<u8>,
     /// Kept across frames so its internal working buffers are allocated once.
     resizer: Resizer,
     /// Resize configuration, built once from [`RESIZE_ALGORITHM`].
     resize_options: ResizeOptions,
     /// Minimum time between two converted frames, from [`CaptureConfig`].
     frame_interval: Duration,
-    /// Quality of the published JPEG, from [`CaptureConfig`].
-    jpeg_quality: u8,
+    /// Longest edge of the published preview, from [`CaptureConfig`].
+    preview_edge: u32,
     /// When the last frame was converted, used to enforce `frame_interval`.
     last_processed: Option<Instant>,
 }
@@ -89,10 +84,10 @@ impl GraphicsCaptureApiHandler for CaptureReceiver {
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
         Ok(Self {
             frame_buffer: ctx.flags.frame_buffer,
+            frame_notify: ctx.flags.frame_notify,
             depad_scratch: Vec::new(),
             preview_rgba: Vec::new(),
             rgb_scratch: Vec::new(),
-            jpeg_scratch: Vec::new(),
             resizer: Resizer::new(),
             // Alpha is always opaque in a monitor capture and is discarded when packing to
             // RGB, so skipping the resampler's premultiply/unpremultiply pass is pure win.
@@ -100,7 +95,7 @@ impl GraphicsCaptureApiHandler for CaptureReceiver {
                 .resize_alg(RESIZE_ALGORITHM)
                 .use_alpha(false),
             frame_interval: ctx.flags.config.frame_interval(),
-            jpeg_quality: ctx.flags.config.sanitized_jpeg_quality(),
+            preview_edge: ctx.flags.config.sanitized_preview_edge(),
             last_processed: None,
         })
     }
@@ -125,8 +120,7 @@ impl GraphicsCaptureApiHandler for CaptureReceiver {
         // Returning an error from this callback makes `windows-capture` tear down the capture
         // thread permanently, so transient failures (DirectX surface loss, a busy staging
         // buffer, a momentary encode hiccup) are logged and skipped instead: the next frame
-        // arrives within `frame_interval`) are logged and skipped instead: the next frame
-        // arrives within [`FRAME_INTERVAL`] and the pipeline keeps running.
+        // arrives within [`Self::frame_interval`] and the pipeline keeps running.
         if let Err(error) = self.process_frame(frame) {
             warn!("skipping captured frame: {error}");
         }
@@ -141,12 +135,16 @@ impl GraphicsCaptureApiHandler for CaptureReceiver {
 impl CaptureReceiver {
     /// Converts one frame and publishes it. Errors are transient by design: the caller logs
     /// and skips them rather than letting them kill the capture thread.
-    fn process_frame(&mut self, frame: &mut Frame) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    fn process_frame(
+        &mut self,
+        frame: &mut Frame,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let source_width = frame.width();
         let source_height = frame.height();
         let swap_red_blue = matches!(frame.color_format(), ColorFormat::Bgra8);
         let expected_len = source_width as usize * source_height as usize * 4;
-        let (preview_width, preview_height) = preview_dimensions(source_width, source_height);
+        let (preview_width, preview_height) =
+            preview_dimensions(source_width, source_height, self.preview_edge);
         let preview_len = preview_width as usize * preview_height as usize * 4;
 
         {
@@ -181,26 +179,16 @@ impl CaptureReceiver {
 
             // Pack the preview into RGB so the encoder can consume it directly.
             pack_rgba_to_rgb(preview.buffer(), &mut self.rgb_scratch, swap_red_blue);
-        } // The mapped staging texture is released here, before the encode below.
-
-        // `JpegEncoder` appends to its writer, so the reused buffer has to be emptied first.
-        self.jpeg_scratch.clear();
-        JpegEncoder::new_with_quality(&mut self.jpeg_scratch, self.jpeg_quality).encode(
-            &self.rgb_scratch,
-            preview_width,
-            preview_height,
-            ExtendedColorType::Rgb8,
-        )?;
+        } // The mapped staging texture is released here.
 
         // Hash the packed preview here, right next to the pixels it describes: consumers then
-        // detect a static screen without decoding the JPEG they are handed.
+        // detect a static screen without decoding the preview they are handed.
         let frame_hash = average_hash(&self.rgb_scratch, preview_width, preview_height);
 
-        // Publish the new payload while reclaiming the previous frame's allocations. The
-        // scratch buffers are handed to `payload` below, so taking the old frame's buffers
-        // back is what keeps the two on a single allocation each.
+        // Publish the new payload while reclaiming the previous frame's allocation. The
+        // scratch buffer is handed to `payload` below, so taking the old frame's buffer
+        // back is what keeps it on a single allocation.
         let payload = FramePayload {
-            jpeg: std::mem::take(&mut self.jpeg_scratch),
             rgb: std::mem::take(&mut self.rgb_scratch),
             width: preview_width,
             height: preview_height,
@@ -212,30 +200,35 @@ impl CaptureReceiver {
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(previous) = published.take() {
-            self.jpeg_scratch = previous.jpeg;
             self.rgb_scratch = previous.rgb;
         }
         *published = Some(payload);
+        drop(published);
+
+        // Wake any consumer blocked in `wait_for_screen_change` now that a fresh frame
+        // is visible. `notify_waiters` pairs with the `Notified::enable` registration the
+        // waiter performs before re-checking the buffer, so no wakeup is ever lost.
+        self.frame_notify.notify_waiters();
 
         Ok(())
     }
 }
 
-/// Destination size for a `width` x `height` frame: scaled down to fit [`PREVIEW_EDGE`] on the
+/// Destination size for a `width` x `height` frame: scaled down to fit `preview_edge` on the
 /// longest edge while preserving the aspect ratio, never upscaled.
-fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
-    if width <= PREVIEW_EDGE && height <= PREVIEW_EDGE {
+fn preview_dimensions(width: u32, height: u32, preview_edge: u32) -> (u32, u32) {
+    if width <= preview_edge && height <= preview_edge {
         return (width, height);
     }
 
     let longest = u64::from(width.max(height));
     let shortest = u64::from(width.min(height));
-    let scaled = (shortest * u64::from(PREVIEW_EDGE) / longest).max(1) as u32;
+    let scaled = (shortest * u64::from(preview_edge) / longest).max(1) as u32;
 
     if width >= height {
-        (PREVIEW_EDGE, scaled)
+        (preview_edge, scaled)
     } else {
-        (scaled, PREVIEW_EDGE)
+        (scaled, preview_edge)
     }
 }
 
@@ -301,10 +294,7 @@ fn average_hash(rgb: &[u8], width: u32, height: u32) -> u64 {
     }
 
     let mean = cells.iter().sum::<u32>() / cells.len() as u32;
-    cells
-        .iter()
-        .enumerate()
-        .fold(0u64, |hash, (bit, cell)| {
-            hash | (u64::from(*cell >= mean) << bit)
-        })
+    cells.iter().enumerate().fold(0u64, |hash, (bit, cell)| {
+        hash | (u64::from(*cell >= mean) << bit)
+    })
 }

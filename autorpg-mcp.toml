@@ -22,6 +22,12 @@ jpeg_quality = 70
 # Whether the mouse cursor is drawn into captured frames.
 with_cursor = true
 
+# Longest edge of the published preview, in pixels. The captured frame is scaled down
+# to fit this edge (never upscaled), and game profiles author their UI layout against
+# the same box. Lower values shrink every published frame's pixel count (and with it
+# the vision model's token cost) at the price of fine visual detail.
+preview_edge = 1024
+
 [server]
 # Maximum duration for hold-style input operations, in milliseconds.
 max_hold_ms = 10000
@@ -33,8 +39,11 @@ stale_hash_distance = 2
 # How long capture_screen blocks waiting for the screen to change, in milliseconds.
 wait_for_change_timeout_ms = 3000
 
-# How often the blocking wait re-checks the shared frame buffer, in milliseconds.
-wait_poll_interval_ms = 100
+[game]
+# Aspect ratio (width / height) of the reference UI box game profiles author their
+# layout against. Should match the captured monitor's aspect ratio so vertical
+# coordinates land correctly.
+reference_aspect_ratio = 1.7777777777777777
 
 [prompts]
 # Path to the prompt instructions template, relative to this configuration file's
