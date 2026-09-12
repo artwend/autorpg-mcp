@@ -149,6 +149,9 @@ pub struct ServerConfig {
     /// How long `capture_screen` blocks waiting for the screen to change, in
     /// milliseconds, before giving up.
     pub wait_for_change_timeout_ms: u64,
+
+    /// Maximum duration the `wait` tool may sleep, in milliseconds.
+    pub max_wait_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -157,6 +160,7 @@ impl Default for ServerConfig {
             max_hold_ms: 10_000,
             stale_hash_distance: 2,
             wait_for_change_timeout_ms: 3_000,
+            max_wait_ms: 60_000,
         }
     }
 }
@@ -164,6 +168,10 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn wait_for_change_timeout(&self) -> Duration {
         Duration::from_millis(self.wait_for_change_timeout_ms)
+    }
+
+    pub fn max_wait(&self) -> Duration {
+        Duration::from_millis(self.max_wait_ms)
     }
 }
 
@@ -230,6 +238,7 @@ mod tests {
         assert_eq!(config.capture.frame_interval_ms, 200);
         assert_eq!(config.capture.preview_edge, 1024);
         assert_eq!(config.server.max_hold_ms, 10_000);
+        assert_eq!(config.server.max_wait_ms, 60_000);
         assert_eq!(config.session.initial_location, "Starter Village");
         assert_eq!(config.prompts.instructions_path, "ai_instructions.md");
     }
@@ -264,6 +273,7 @@ mod tests {
             max_hold_ms = 5000
             stale_hash_distance = 4
             wait_for_change_timeout_ms = 1500
+            max_wait_ms = 30000
 
             [prompts]
             instructions_path = "prompts/farm.md"
@@ -279,6 +289,7 @@ mod tests {
         assert!(!config.capture.with_cursor);
         assert_eq!(config.game.sanitized_reference_aspect_ratio(), 2.0);
         assert_eq!(config.server.wait_for_change_timeout(), Duration::from_millis(1500));
+        assert_eq!(config.server.max_wait(), Duration::from_millis(30000));
         assert_eq!(config.prompts.instructions_path, "prompts/farm.md");
         assert_eq!(config.session.initial_hp, 80);
     }

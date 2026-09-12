@@ -24,8 +24,11 @@ each iteration to sync HP or stamina; it is only for zone changes (see below).
 7. Repeat steps 1-6 until {duration} minute(s) have elapsed.
 
 ## Defense
-- Block incoming attacks with a right mouse click (`click_mouse` with
-  `button: "right"`) when a mob is winding up or attacking.
+- Block incoming attacks by holding the right mouse button (`hold_mouse` with
+  `button: "right"`, `action: "hold"`, and a `duration_ms` long enough to cover
+  the incoming swing) when a mob is winding up or attacking. A plain
+  `click_mouse` is only an instantaneous down/up pulse and will not sustain a
+  defensive stance.
 - Dodge with Shift (`press_key` with key "shift") only if stamina > 20%;
   dodging at or below that threshold risks leaving no stamina to block or
   attack. Prefer blocking when stamina is low.
@@ -40,30 +43,17 @@ If `capture_screen` reports no visible change (menus, dialogue, inventory), take
 a different action or call it again with `force: true` to receive the current
 frame as an image.
 
+## Waiting
+Use `wait` with `duration_ms` when the game needs time to settle before the next
+action: loading screens, respawns, teleports, cutscenes, or after drinking a
+potion. Add a short `reason` describing why. The server caps each wait at
+`max_wait_ms`; for longer pauses call `wait` repeatedly. Prefer `wait` over
+repeatedly re-calling `capture_screen` while nothing can change yet.
+
 ## Rules
 - Never let HP drop below {potion_threshold}% without drinking a potion.
 - Never dodge when stamina <= 20%; block instead.
 - Keep moving between kills to find the next target.
+- Use `wait` instead of spamming `capture_screen` when a delay is unavoidable.
 - Stop immediately if HP reaches 0 or the session is interrupted.
 - Report a summary of kills, potions used, and final HP when done.
-
-## RESPONSE FORMULATION CONSTRAINTS
-You must analyze the incoming context and answer STRICTLY with a raw, validated JSON block. 
-- DO NOT wrap the output in markdown code blocks like ```json ... ```.
-- DO NOT append any polite greetings, debugging footnotes, or conversational commentary.
-- Your output must match this schema exactly:
-
-{
-  "state_update": {
-    "location": "String (parsed from compass or session)",
-    "has_target": Boolean,
-    "target_name": "String or null"
-  },
-  "decision": {
-    "reasoning": "Short summary of your tactical choice in English (Maximum 15 words).",
-    "tool_to_call": "String (Name of tool)",
-    "arguments": {
-      "key_or_type_or_prefix": "String or Integer based on chosen tool parameters"
-    }
-  }
-}

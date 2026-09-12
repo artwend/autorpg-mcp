@@ -39,6 +39,10 @@ stale_hash_distance = 2
 # How long capture_screen blocks waiting for the screen to change, in milliseconds.
 wait_for_change_timeout_ms = 3000
 
+# Maximum duration the wait tool may sleep, in milliseconds. Longer pauses require
+# repeated wait calls.
+max_wait_ms = 60000
+
 [game]
 # Aspect ratio (width / height) of the reference UI box game profiles author their
 # layout against. Should match the captured monitor's aspect ratio so vertical

@@ -108,6 +108,14 @@ pub struct ScrollMouseArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct WaitArgs {
+    /// How long to wait in milliseconds (default 500, max from the server's max_wait_ms limit)
+    duration_ms: Option<u64>,
+    /// Optional note about what this delay is for (e.g. "loading screen", "death respawn"); recorded in the session log
+    reason: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct CaptureScreenArgs {
     /// When true, skip the wait-for-change window and return the latest frame immediately,
     /// even if the screen has not visibly changed. Use this to inspect static screens
@@ -218,21 +226,36 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let metrics = telemetry;
         if timed_out {
             return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                "Screen unchanged for the wait window. Telemetry: HP = {}%, Stamina = {}%. \
+                "Screen unchanged for the wait window. Telemetry: HP = {}%, Stamina = {}%, \
+                Abilities: Q = {}, R = {}, F = {}. \
                 No visible change detected; wait longer, take a different action, or call \
                 again with force=true to receive the current frame as an image.",
-                metrics.player_hp, metrics.stamina
+                metrics.player_hp,
+                metrics.stamina,
+                Self::format_ability(metrics.q_ready),
+                Self::format_ability(metrics.r_ready),
+                Self::format_ability(metrics.f_ready)
             ))]));
         }
 
         let img_base64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
         Ok(CallToolResult::success(vec![
             ContentBlock::text(format!(
-                "Display frame captured. Server-side Telemetry: HP = {}%, Stamina = {}%.",
-                metrics.player_hp, metrics.stamina
+                "Display frame captured. Server-side Telemetry: HP = {}%, Stamina = {}%, \
+                Abilities: Q = {}, R = {}, F = {}.",
+                metrics.player_hp,
+                metrics.stamina,
+                Self::format_ability(metrics.q_ready),
+                Self::format_ability(metrics.r_ready),
+                Self::format_ability(metrics.f_ready)
             )),
             ContentBlock::image(img_base64, "image/jpeg"),
         ]))
+    }
+
+    /// Formats an ability readiness flag as READY or COOLDOWN for telemetry text.
+    fn format_ability(ready: bool) -> &'static str {
+        if ready { "READY" } else { "COOLDOWN" }
     }
 
     /// Mutates variables and logs a state transition context record.
@@ -589,6 +612,33 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             amount.abs(),
             if amount >= 0 { "up" } else { "down" }
         );
+        self.session.write().await.record_event(message.clone());
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+    }
+
+    /// Waits for a fixed delay so the game state can settle.
+    ///
+    /// Useful after loading screens, respawns, teleports, cutscenes or any action
+    /// whose result arrives later than the next frame. The server caps the duration
+    /// at `max_wait_ms`; when a longer pause is needed, call `wait` repeatedly.
+    #[tool(
+        description = "Waits for a fixed delay (e.g. after a loading screen, respawn or teleport) before acting again."
+    )]
+    async fn wait(
+        &self,
+        Parameters(WaitArgs { duration_ms, reason }): Parameters<WaitArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let duration = Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_wait_ms));
+
+        tokio::time::sleep(duration).await;
+
+        let message = match reason.as_deref() {
+            Some(reason) if !reason.is_empty() => {
+                format!("Waited {} ms: {}.", duration.as_millis(), reason)
+            }
+            _ => format!("Waited {} ms.", duration.as_millis()),
+        };
         self.session.write().await.record_event(message.clone());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
