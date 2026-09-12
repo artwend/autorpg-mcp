@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "autorpg-mcp": {
-      "command": "D:\\projects\\gamedev\\autorpg-mcp\\target\\debug\\autorpg-mcp.exe",
-      "args": [],
-      "env": {}
-    }
-  }
-}

@@ -1,0 +1,50 @@
+# autorpg-mcp configuration.
+#
+# Loaded from this file (autorpg-mcp.toml) in the working directory, or from the
+# path given as the first CLI argument / the AUTORPG_MCP_CONFIG environment variable.
+# Every key is optional; missing keys fall back to the defaults shown below.
+# Unknown keys are rejected at startup.
+
+[capture]
+# Minimum time between two frames that are actually converted, in milliseconds.
+# Frame delivery is asynchronous and consumers only read the latest frame, so
+# anything arriving sooner than this is dropped untouched.
+frame_interval_ms = 200
+
+# Update interval hint handed to Windows, in milliseconds. Advisory and jittery;
+# kept shorter than frame_interval_ms so the receiver always has a fresh frame.
+os_update_hint_ms = 150
+
+# Quality of the published JPEG (1-100). Lower quality shrinks the payload and
+# shortens the encode step.
+jpeg_quality = 70
+
+# Whether the mouse cursor is drawn into captured frames.
+with_cursor = true
+
+[server]
+# Maximum duration for hold-style input operations, in milliseconds.
+max_hold_ms = 10000
+
+# Hamming distance between two frame hashes that still counts as "the screen did
+# not move". Raise it if idle animations keep defeating the static-screen wait.
+stale_hash_distance = 2
+
+# How long capture_screen blocks waiting for the screen to change, in milliseconds.
+wait_for_change_timeout_ms = 3000
+
+# How often the blocking wait re-checks the shared frame buffer, in milliseconds.
+wait_poll_interval_ms = 100
+
+[prompts]
+# Path to the prompt instructions template, relative to this configuration file's
+# directory. {target}, {duration} and {potion_threshold} placeholders are
+# substituted per prompt call; the file is re-read on every call, so edits apply
+# without a restart.
+instructions_path = "ai_instructions.md"
+
+[session]
+# Initial session state published before any tool call arrives.
+initial_hp = 100
+initial_stamina = 100
+initial_location = "Starter Village"

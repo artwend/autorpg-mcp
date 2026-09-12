@@ -1,29 +1,35 @@
 //! MCP server: application context, tool argument schemas and tool implementations.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use enigo::{Axis, Button, Coordinate, Direction, Key, Keyboard, Mouse};
+use base64::Engine;
+use enigo::{Button, Coordinate, Direction, Keyboard, Mouse};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, ContentBlock, PromptMessage, Role, ServerCapabilities, ServerInfo},
-    schemars,
-    prompt, prompt_handler, prompt_router, tool, tool_handler, tool_router,
+    prompt, prompt_handler, prompt_router, schemars, tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
-use base64::Engine;
 
+use crate::capture::PREVIEW_EDGE;
+use crate::config::ServerConfig;
 use crate::error::{input_error, internal_error, invalid_params};
-use crate::input::{direction_scancode, ops};
+use crate::games::Resolution;
+use crate::input::{direction_scancode, key_scancode, ops};
 use crate::state::{SharedFrameBuffer, SharedSession};
-
 /// Application context shared by all MCP tools.
 #[derive(Clone)]
 pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     session: SharedSession,
     frame_buffer: SharedFrameBuffer,
     input: Arc<Mutex<Input>>,
+    /// Tool limits loaded from the configuration file.
+    limits: ServerConfig,
+    /// Path of the prompt instructions template, resolved against the configuration
+    /// file's directory. Re-read on every prompt call so edits apply without a restart.
+    instructions_path: std::path::PathBuf,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -32,12 +38,6 @@ pub struct UpdateMetricsArgs {
     hp: i32,
     /// Current zone location identifier
     location: String,
-}
-
-#[derive(Deserialize, schemars::JsonSchema)]
-pub struct DumpSessionArgs {
-    /// Named prefix string for target JSON log tracking file
-    prefix: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -50,17 +50,23 @@ pub struct MovePlayerArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct PressKeyArgs {
-    /// The key to press, as a single character (e.g. "e", "1", " ")
+    /// The key to press: a single character (e.g. "e", "1", " ") or a named key (e.g. "space", "enter", "escape", "tab", "f1")
     key: String,
     /// How long to hold the key in milliseconds (default 50, max 10000)
     duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct InputTextArgs {
+    /// The text to type into the focused input field (chat, search, etc.)
+    text: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct MoveMouseArgs {
-    /// Target X coordinate in pixels
+    /// Target X coordinate in captured-frame (image) pixels; scaled to native display pixels
     x: i32,
-    /// Target Y coordinate in pixels
+    /// Target Y coordinate in captured-frame (image) pixels; scaled to native display pixels
     y: i32,
     /// If true, the coordinates are relative to the current cursor position
     relative: Option<bool>,
@@ -76,7 +82,7 @@ pub struct ClickMouseArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ScrollMouseArgs {
-    /// Scroll amount in wheel clicks; positive scrolls down, negative scrolls up
+    /// Scroll amount in wheel clicks; positive scrolls up, negative scrolls down
     amount: i32,
 }
 
@@ -90,37 +96,90 @@ pub struct StartFarmArgs {
     potion_threshold: Option<i32>,
 }
 
-/// Maximum duration for hold-style input operations.
-const MAX_HOLD_MS: u64 = 10_000;
-
 #[tool_router]
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
-    pub fn new(session: SharedSession, frame_buffer: SharedFrameBuffer, input: Input) -> Self {
+    pub fn new(
+        session: SharedSession,
+        frame_buffer: SharedFrameBuffer,
+        input: Input,
+        limits: ServerConfig,
+        instructions_path: std::path::PathBuf,
+    ) -> Self {
         Self {
             session,
             frame_buffer,
             input: Arc::new(Mutex::new(input)),
+            limits,
+            instructions_path,
         }
     }
 
     /// Grabs a highly optimized frame of the primary monitor.
+    ///
+    /// If the screen has not visibly changed since the last capture, this blocks until it does
+    /// (or until the configured wait timeout elapses), so a static screen never produces a
+    /// redundant frame or a redundant model round trip.
     #[tool(description = "Grabs a highly optimized frame of the primary monitor.")]
     async fn capture_screen(&self) -> Result<CallToolResult, McpError> {
-        let guard = match self.frame_buffer.lock() {
-            Ok(lock) => lock,
-            Err(poisoned) => poisoned.into_inner(),
+        // Block until the screen changes; this is the server-side replacement for a "wait" tool.
+        let timed_out = self.wait_for_screen_change().await?;
+
+        // Session lock first, frame lock second: the frame lock is a `std` mutex and must never
+        // be held across the await below.
+        let mut session = self.session.write().await;
+
+        // Everything read out of the frame happens under one short critical section: sparse
+        // telemetry pixel samples and a copy of the (small) JPEG bytes. No image construction
+        // or base64 encoding runs under the lock, so the capture thread's `on_frame_arrived`
+        // is never blocked behind per-call image work.
+        let (telemetry, jpeg) = {
+            let guard = match self.frame_buffer.lock() {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let Some(frame) = guard.as_ref() else {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "No active display buffer detected yet. Try again.",
+                )]));
+            };
+
+            let Some(pixels) = frame.as_rgb_view() else {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "Published display frame is malformed. Try again.",
+                )]));
+            };
+            let resolution = Resolution::new(frame.width, frame.height);
+            let mut metrics = session.active_game.parse_telemetry(&pixels, resolution);
+            // Zone is MCP-managed via `update_game_metrics`; pixel parsing cannot read it,
+            // so carry the session's location forward instead of dropping it.
+            metrics.location = session.current_metrics.location.clone();
+            // Persist parsed telemetry so `get_game_metrics` and `record_event` snapshots
+            // reflect the live frame instead of stale initialization data.
+            session.current_metrics = metrics.clone();
+            session.last_frame_hash = Some(frame.hash);
+
+            // The JPEG is copied out so the lock can be dropped before the (potentially
+            // slow) base64 encode below.
+            (metrics, frame.jpeg.clone())
         };
 
-        if let Some(bytes) = guard.as_ref() {
-            let img_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-            Ok(CallToolResult::success(vec![
-                ContentBlock::image(img_base64, "image/png")
-            ]))
-        } else {
-            Ok(CallToolResult::error(vec![ContentBlock::text(
-                "No active display buffer detected yet. Try again.",
-            )]))
+        let metrics = telemetry;
+        if timed_out {
+            return Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                "Screen unchanged for the wait window. Telemetry: HP = {}%, Stamina = {}%. \
+                No visible change detected; wait longer or take a different action.",
+                metrics.player_hp, metrics.stamina
+            ))]));
         }
+
+        let img_base64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+        Ok(CallToolResult::success(vec![
+            ContentBlock::text(format!(
+                "Display frame captured. Server-side Telemetry: HP = {}%, Stamina = {}%.",
+                metrics.player_hp, metrics.stamina
+            )),
+            ContentBlock::image(img_base64, "image/jpeg"),
+        ]))
     }
 
     /// Mutates variables and logs a state transition context record.
@@ -139,11 +198,28 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         )]))
     }
 
+    /// Returns the current in-memory game metrics as JSON.
+    #[tool(
+        description = "Returns the current in-memory game metrics snapshot (HP, stamina, ability readiness, location, combat state) as JSON."
+    )]
+    async fn get_game_metrics(&self) -> Result<CallToolResult, McpError> {
+        let session = self.session.read().await;
+        let json =
+            serde_json::to_string_pretty(&session.current_metrics).map_err(internal_error)?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+
     /// Moves the player by holding a WASD movement key for the given duration.
-    #[tool(description = "Moves the player by holding a WASD movement key (layout-independent scancode).")]
+    #[tool(
+        description = "Moves the player by holding a WASD movement key (layout-independent scancode)."
+    )]
     async fn move_player(
         &self,
-        Parameters(MovePlayerArgs { direction, duration_ms }): Parameters<MovePlayerArgs>,
+        Parameters(MovePlayerArgs {
+            direction,
+            duration_ms,
+        }): Parameters<MovePlayerArgs>,
     ) -> Result<CallToolResult, McpError> {
         let scancode = direction_scancode(&direction).ok_or_else(|| {
             invalid_params(format!(
@@ -151,7 +227,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 direction
             ))
         })?;
-        let duration = Duration::from_millis(duration_ms.unwrap_or(500).min(MAX_HOLD_MS));
+        let duration = Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_hold_ms));
 
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -173,37 +249,82 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     }
 
     /// Presses (and optionally holds) a keyboard key.
-    #[tool(description = "Presses a keyboard key given as a single character, optionally holding it.")]
+    ///
+    /// Accepts a single character (e.g. "e", "1", " ") or a named key
+    /// (e.g. "space", "enter", "escape", "tab", "f1"). The key is dispatched as a
+    /// physical scancode so DirectInput/RawInput game engines receive it
+    /// regardless of the active keyboard layout. For typing text into input
+    /// fields, use `input_text` instead.
+    #[tool(
+        description = "Presses a keyboard key (single character or named key like 'space', 'enter', 'escape', 'tab', 'f1') as a physical scancode, optionally holding it."
+    )]
     async fn press_key(
         &self,
         Parameters(PressKeyArgs { key, duration_ms }): Parameters<PressKeyArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut chars = key.chars();
-        let ch = chars.next().filter(|_| chars.next().is_none()).ok_or_else(|| {
+        let scancode = key_scancode(&key).ok_or_else(|| {
             invalid_params(format!(
-                "Invalid key: {:?}. Must be a single character.",
+                "Invalid key: {:?}. Use a single character (e.g. \"e\", \"1\", \" \") or a named key (e.g. \"space\", \"enter\", \"escape\", \"tab\", \"f1\").",
                 key
             ))
         })?;
-        let duration = Duration::from_millis(duration_ms.unwrap_or(50).min(MAX_HOLD_MS));
+        let duration = Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
 
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut simulator = input.lock().map_err(|e| e.to_string())?;
-            ops::hold_key(&mut *simulator, Key::Unicode(ch), duration).map_err(|e| e.to_string())
+            ops::hold_scancode(&mut *simulator, scancode, duration).map_err(|e| e.to_string())
         })
         .await
         .map_err(input_error)?
         .map_err(input_error)?;
 
-        let message = format!("Key '{}' pressed for {} ms.", ch, duration.as_millis());
+        let message = format!("Key '{}' pressed for {} ms.", key, duration.as_millis());
+        self.session.write().await.record_event(message.clone());
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
+    }
+
+    /// Types text into the focused input field.
+    ///
+    /// Dispatches each character as a Unicode text event (`KEYEVENTF_UNICODE`),
+    /// which is what text input fields consume. Game engines ignore these events,
+    /// so use `press_key` for gameplay input.
+    #[tool(
+        description = "Types text into the focused input field (chat, search, etc.) using Unicode text events."
+    )]
+    async fn input_text(
+        &self,
+        Parameters(InputTextArgs { text }): Parameters<InputTextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if text.is_empty() {
+            return Err(invalid_params("Text must not be empty."));
+        }
+
+        let message = format!("Typed text: {:?}", text);
+
+        let input = Arc::clone(&self.input);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut simulator = input.lock().map_err(|e| e.to_string())?;
+            ops::type_text(&mut *simulator, &text).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(input_error)?
+        .map_err(input_error)?;
+
         self.session.write().await.record_event(message.clone());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 
     /// Moves the mouse cursor to absolute (or relative) screen coordinates.
-    #[tool(description = "Moves the mouse cursor to absolute screen coordinates, or relative to its current position.")]
+    ///
+    /// Coordinates are in the captured frame's image space (the preview scaled to
+    /// [`PREVIEW_EDGE`] on its longest edge) and are scaled up to native display pixels before
+    /// the move, so a position picked off the image lands on the same physical spot.
+    #[tool(
+        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or relative to its current position."
+    )]
     async fn move_mouse(
         &self,
         Parameters(MoveMouseArgs { x, y, relative }): Parameters<MoveMouseArgs>,
@@ -213,25 +334,47 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         } else {
             Coordinate::Abs
         };
+        let (image_x, image_y) = (x, y);
 
         let input = Arc::clone(&self.input);
         let (x, y) = tokio::task::spawn_blocking(move || -> Result<(i32, i32), String> {
             let mut simulator = input.lock().map_err(|e| e.to_string())?;
-            simulator.move_mouse(x, y, coordinate).map_err(|e| e.to_string())?;
+
+            // The capture pipeline publishes a preview scaled to PREVIEW_EDGE on its longest
+            // edge (never upscaled), so image-space coordinates must be scaled up to native
+            // display pixels before the move.
+            let (native_w, native_h) = simulator.main_display().map_err(|e| e.to_string())?;
+            let longest = native_w.max(native_h);
+            let scale = if longest > PREVIEW_EDGE as i32 {
+                longest as f64 / PREVIEW_EDGE as f64
+            } else {
+                1.0
+            };
+            let target_x = (x as f64 * scale).round() as i32;
+            let target_y = (y as f64 * scale).round() as i32;
+
+            simulator
+                .move_mouse(target_x, target_y, coordinate)
+                .map_err(|e| e.to_string())?;
             simulator.location().map_err(|e| e.to_string())
         })
         .await
         .map_err(input_error)?
         .map_err(input_error)?;
 
-        let message = format!("Mouse moved to ({}, {}).", x, y);
+        let message = format!(
+            "Mouse moved to image ({}, {}) -> native ({}, {}).",
+            image_x, image_y, x, y
+        );
         self.session.write().await.record_event(message.clone());
 
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 
     /// Clicks a mouse button (left/right/middle, optional double click).
-    #[tool(description = "Clicks a mouse button: left (default), right or middle; supports double click.")]
+    #[tool(
+        description = "Clicks a mouse button: left (default), right or middle; supports double click."
+    )]
     async fn click_mouse(
         &self,
         Parameters(ClickMouseArgs { button, double }): Parameters<ClickMouseArgs>,
@@ -248,7 +391,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 return Err(invalid_params(format!(
                     "Invalid button: {}. Use left/right/middle.",
                     other
-                )))
+                )));
             }
         };
         let double = double.unwrap_or(false);
@@ -282,7 +425,9 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     }
 
     /// Scrolls the mouse wheel vertically.
-    #[tool(description = "Scrolls the mouse wheel; positive amounts scroll down, negative scroll up.")]
+    #[tool(
+        description = "Scrolls the mouse wheel; positive amounts scroll up, negative scroll down (Windows WHEEL_DELTA convention)."
+    )]
     async fn scroll_mouse(
         &self,
         Parameters(ScrollMouseArgs { amount }): Parameters<ScrollMouseArgs>,
@@ -290,9 +435,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut simulator = input.lock().map_err(|e| e.to_string())?;
-            simulator
-                .scroll(amount, Axis::Vertical)
-                .map_err(|e| e.to_string())
+            ops::scroll_vertical(&mut *simulator, amount).map_err(|e| e.to_string())
         })
         .await
         .map_err(input_error)?
@@ -301,7 +444,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let message = format!(
             "Scrolled {} clicks {}.",
             amount.abs(),
-            if amount >= 0 { "down" } else { "up" }
+            if amount >= 0 { "up" } else { "down" }
         );
         self.session.write().await.record_event(message.clone());
 
@@ -309,10 +452,56 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     }
 }
 
+impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
+    /// Polls the shared frame buffer until the screen visibly changes or the wait times out.
+    ///
+    /// Returns `true` if the wait timed out with the screen still static.
+    ///
+    /// Lock discipline: session lock first, frame lock second, and neither is ever held
+    /// across an await.
+    async fn wait_for_screen_change(&self) -> Result<bool, McpError> {
+        let deadline = Instant::now() + self.limits.wait_for_change_timeout();
+        loop {
+            let changed = {
+                let session = self.session.read().await;
+                let last_hash = session.last_frame_hash;
+                let guard = match self.frame_buffer.lock() {
+                    Ok(lock) => lock,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                match guard.as_ref() {
+                    // No buffer published yet; keep polling.
+                    None => false,
+                    Some(frame) => last_hash.is_none_or(|last| {
+                        calculate_hamming_distance(frame.hash, last)
+                            > self.limits.stale_hash_distance
+                    }),
+                }
+            };
+            if changed {
+                return Ok(false);
+            }
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+            tokio::time::sleep(self.limits.wait_poll_interval()).await;
+        }
+    }
+}
+
+/// Computes the Hamming Distance (number of differing bits) between two hashes.
+/// Returns a value between 0 (identical) and 64 (completely different).
+fn calculate_hamming_distance(hash1: u64, hash2: u64) -> u32 {
+    // XOR finds differing bits, count_ones counts them
+    (hash1 ^ hash2).count_ones()
+}
+
 #[prompt_router]
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     /// Starts an automated mob-farming loop.
-    #[prompt(description = "Starts an automated mob-farming loop that moves to nearby mobs, attacks them, and uses abilities/potions until the target duration elapses.")]
+    #[prompt(
+        description = "Starts an automated mob-farming loop that moves to nearby mobs, attacks them, and uses abilities/potions until the target duration elapses."
+    )]
     async fn start_farm(
         &self,
         Parameters(args): Parameters<StartFarmArgs>,
@@ -321,29 +510,19 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let target = args.target.unwrap_or_else(|| "any nearby mob".to_string());
         let potion_threshold = args.potion_threshold.unwrap_or(30).clamp(0, 100);
 
-        let instructions = format!(
-            r#"# AUTOMATED MOB FARMING SESSION
-
-You are now running an automated mob-farming loop for the ACTION RPG game.
-
-## Objective
-Farm {target} continuously for {duration} minute(s).
-
-## Loop
-1. Call `capture_screen` to grab the current frame and assess the battlefield.
-2. Call `update_game_metrics` with the observed HP and zone location.
-3. If HP <= {potion_threshold}%, press '1' to drink a potion.
-4. If a mob is in range, attack with a left mouse click (`click_mouse`).
-5. If no mob is in range, move toward the nearest mob using `move_player` (forward/back/left/right).
-6. Use weapon abilities when ready: press 'Q', 'R', or 'F' (`press_key`) if the server telemetry flags them as READY.
-7. Repeat steps 1-6 until {duration} minute(s) have elapsed.
-
-## Rules
-- Never let HP drop below {potion_threshold}% without drinking a potion.
-- Keep moving between kills to find the next target.
-- Stop immediately if HP reaches 0 or the session is interrupted.
-- Report a summary of kills, potions used, and final HP when done."#
-        );
+        // The template lives outside the binary so it can be edited without a rebuild;
+        // `{target}`, `{duration}` and `{potion_threshold}` are substituted per call.
+        let template = std::fs::read_to_string(&self.instructions_path).map_err(|error| {
+            internal_error(format!(
+                "failed to read prompt instructions from {}: {}",
+                self.instructions_path.display(),
+                error
+            ))
+        })?;
+        let instructions = template
+            .replace("{target}", &target)
+            .replace("{duration}", &duration.to_string())
+            .replace("{potion_threshold}", &potion_threshold.to_string());
 
         Ok(vec![PromptMessage::new_text(Role::User, instructions)])
     }
@@ -353,7 +532,12 @@ Farm {target} continuously for {duration} minute(s).
 #[prompt_handler]
 impl<Input: Keyboard + Mouse + Send + 'static> ServerHandler for GameServer<Input> {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().enable_prompts().build())
-            .with_server_info(rmcp::model::Implementation::from_build_env())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_prompts()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::from_build_env())
     }
 }
