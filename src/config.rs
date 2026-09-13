@@ -25,10 +25,10 @@ pub struct Config {
     pub server: ServerConfig,
     /// Game profile layout tuning.
     pub game: GameConfig,
+    /// Human-like mouse movement tuning.
+    pub mouse: MouseConfig,
     /// Prompt templates.
     pub prompts: PromptsConfig,
-    /// Initial session state.
-    pub session: SessionConfig,
 }
 
 impl Config {
@@ -162,6 +162,45 @@ impl GameConfig {
     }
 }
 
+/// Human-like mouse movement tuning.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MouseConfig {
+    /// Multiplier applied to the WindMouse force constants (gravity, wind and the
+    /// per-step velocity ceiling). Above 1.0 moves faster and straighter, below
+    /// 1.0 slower and wobblier. 1.0 matches the algorithm's DreamBot defaults.
+    pub speed_multiplier: f64,
+
+    /// Base time between two cursor updates in a human-like move, in milliseconds.
+    /// Lower values dispatch the same path in less wall-clock time.
+    pub step_interval_ms: u64,
+}
+
+impl Default for MouseConfig {
+    fn default() -> Self {
+        Self {
+            speed_multiplier: 1.0,
+            step_interval_ms: 8,
+        }
+    }
+}
+
+impl MouseConfig {
+    /// Speed multiplier clamped into a sane range; non-finite values fall back to 1.0.
+    pub fn sanitized_speed_multiplier(&self) -> f64 {
+        if self.speed_multiplier.is_finite() {
+            self.speed_multiplier.clamp(0.1, 20.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// Step interval clamped to at least 1 ms so a move can never spin without pause.
+    pub fn step_interval(&self) -> Duration {
+        Duration::from_millis(self.step_interval_ms.max(1))
+    }
+}
+
 /// MCP tool limits.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -222,28 +261,6 @@ impl Default for PromptsConfig {
     }
 }
 
-/// Initial session state published before any tool call arrives.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct SessionConfig {
-    /// Initial player HP.
-    pub initial_hp: i32,
-    /// Initial stamina.
-    pub initial_stamina: i32,
-    /// Initial zone location identifier.
-    pub initial_location: String,
-}
-
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            initial_hp: 100,
-            initial_stamina: 100,
-            initial_location: "Starter Village".to_string(),
-        }
-    }
-}
-
 /// Resolves the configuration path: explicit CLI argument, then the
 /// [`CONFIG_PATH_ENV`] environment variable, then [`DEFAULT_CONFIG_PATH`].
 pub fn resolve_path(explicit: Option<&str>) -> std::path::PathBuf {
@@ -267,8 +284,9 @@ mod tests {
         assert_eq!(config.capture.preview_edge, 1024);
         assert_eq!(config.server.max_hold_ms, 10_000);
         assert_eq!(config.server.max_wait_ms, 60_000);
-        assert_eq!(config.session.initial_location, "Starter Village");
         assert_eq!(config.prompts.instructions_path, "ai_instructions.md");
+        assert_eq!(config.mouse.speed_multiplier, 1.0);
+        assert_eq!(config.mouse.step_interval_ms, 8);
     }
 
     #[test]
@@ -281,7 +299,9 @@ mod tests {
 
     #[test]
     fn capture_target_parses() {
-        let config = Config::from_str("[capture]\ntarget = \"window\"\nwindow_name = \"Dark Souls\"\n").unwrap();
+        let config =
+            Config::from_str("[capture]\ntarget = \"window\"\nwindow_name = \"Dark Souls\"\n")
+                .unwrap();
         assert_eq!(config.capture.target, CaptureTarget::Window);
         assert_eq!(config.capture.window_name, "Dark Souls");
 
@@ -311,6 +331,10 @@ mod tests {
             [game]
             reference_aspect_ratio = 2.0
 
+            [mouse]
+            speed_multiplier = 3.0
+            step_interval_ms = 4
+
             [server]
             max_hold_ms = 5000
             stale_hash_distance = 4
@@ -319,20 +343,19 @@ mod tests {
 
             [prompts]
             instructions_path = "prompts/farm.md"
-
-            [session]
-            initial_hp = 80
-            initial_stamina = 90
-            initial_location = "Dungeon"
             "#,
         )
         .unwrap();
         assert_eq!(config.capture.frame_interval(), Duration::from_millis(100));
         assert!(!config.capture.with_cursor);
         assert_eq!(config.game.sanitized_reference_aspect_ratio(), 2.0);
-        assert_eq!(config.server.wait_for_change_timeout(), Duration::from_millis(1500));
+        assert_eq!(config.mouse.sanitized_speed_multiplier(), 3.0);
+        assert_eq!(config.mouse.step_interval(), Duration::from_millis(4));
+        assert_eq!(
+            config.server.wait_for_change_timeout(),
+            Duration::from_millis(1500)
+        );
         assert_eq!(config.server.max_wait(), Duration::from_millis(30000));
         assert_eq!(config.prompts.instructions_path, "prompts/farm.md");
-        assert_eq!(config.session.initial_hp, 80);
     }
 }

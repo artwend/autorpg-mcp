@@ -151,14 +151,21 @@ impl ActionRPG {
 
     /// Maps a y coordinate authored at `self.reference.height` onto `resolution`.
     fn scale_y(&self, reference_y: u32, resolution: Resolution) -> u32 {
-        (reference_y as f32 * resolution.height as f32 / self.reference.height as f32).round() as u32
+        (reference_y as f32 * resolution.height as f32 / self.reference.height as f32).round()
+            as u32
     }
 
     /// Internal pixel helper to scan horizontal bar segments.
     ///
     /// Coordinates are clamped to the frame, so a bar authored for a larger layout degrades
     /// gracefully instead of panicking on small frames.
-    fn scan_horizontal_bar<F>(pixels: &RgbView, start_x: u32, end_x: u32, y: u32, color_match: F) -> i32
+    fn scan_horizontal_bar<F>(
+        pixels: &RgbView,
+        start_x: u32,
+        end_x: u32,
+        y: u32,
+        color_match: F,
+    ) -> i32
     where
         F: Fn(RgbPixel) -> bool,
     {
@@ -203,7 +210,9 @@ impl ActionRPG {
             return 0;
         }
 
-        (start_x..end_x).filter(|&x| color_match(pixels.get_pixel(x, y))).count() as u32
+        (start_x..end_x)
+            .filter(|&x| color_match(pixels.get_pixel(x, y)))
+            .count() as u32
     }
 
     /// Whether the ability icon centered at `(x, y)` is off cooldown (lit).
@@ -215,8 +224,7 @@ impl ActionRPG {
         // heavily red-biased, so a pixel only counts as lit when its blue channel
         // keeps pace with red (white/bright art) on top of the luminance gate.
         let lit = |p: RgbPixel| {
-            Self::calculate_luminance(p.r as f32, p.g as f32, p.b as f32)
-                > ABILITY_READY_LUMINANCE
+            Self::calculate_luminance(p.r as f32, p.g as f32, p.b as f32) > ABILITY_READY_LUMINANCE
                 && p.b > 100
                 && p.b as u32 * 5 > p.r as u32 * 2
         };
@@ -274,10 +282,14 @@ impl GameProfile for ActionRPG {
 
         // 3. Scan Skill Cooldown Pixels (Bottom-right weapon ability icons)
         let ability_y = self.scale_y(self.ability_icon_y, resolution);
-        let q_ready = Self::is_ability_ready(pixels, self.scale_x(self.q_icon_x, resolution), ability_y);
-        let r_ready = Self::is_ability_ready(pixels, self.scale_x(self.r_icon_x, resolution), ability_y);
-        let f_ready = Self::is_ability_ready(pixels, self.scale_x(self.f_icon_x, resolution), ability_y);
-        let g_ready = Self::is_ability_ready(pixels, self.scale_x(self.g_icon_x, resolution), ability_y);
+        let q_ready =
+            Self::is_ability_ready(pixels, self.scale_x(self.q_icon_x, resolution), ability_y);
+        let r_ready =
+            Self::is_ability_ready(pixels, self.scale_x(self.r_icon_x, resolution), ability_y);
+        let f_ready =
+            Self::is_ability_ready(pixels, self.scale_x(self.f_icon_x, resolution), ability_y);
+        let g_ready =
+            Self::is_ability_ready(pixels, self.scale_x(self.g_icon_x, resolution), ability_y);
 
         // 4. Crossed-swords combat indicator left of the health bar.
         let in_combat = Self::is_in_combat(

@@ -85,7 +85,9 @@ pub struct HeldButtons(Mutex<Vec<Button>>);
 
 impl HeldButtons {
     fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Button>> {
-        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Records `button` as held, returning `false` when it already was.

@@ -59,7 +59,6 @@ See [`autorpg-mcp.toml`](autorpg-mcp.toml) for the annotated reference. The main
 | `[server]` | Hold limits, stale-frame hash distance, wait timeouts |
 | `[game]` | Reference aspect ratio the game profile authors its UI layout against |
 | `[prompts]` | Path to the prompt instructions template |
-| `[session]` | Initial HP, stamina and location published before any tool call |
 
 ### Capture target
 

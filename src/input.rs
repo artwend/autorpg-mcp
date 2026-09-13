@@ -164,70 +164,70 @@ fn char_scancode(ch: char) -> Option<u16> {
 #[cfg_attr(not(feature = "input-simulator"), allow(dead_code))]
 pub fn scancode_to_vk(scancode: u16) -> Option<u16> {
     let vk = match scancode {
-        0x01 => 0x1B,             // Escape
+        0x01 => 0x1B,                   // Escape
         0x02..=0x0A => scancode + 0x2F, // Digits 1-9 -> VK 0x31..0x39
-        0x0B => 0x30,             // 0
-        0x0C => 0xBD,             // -
-        0x0D => 0xBB,             // =
-        0x0E => 0x08,             // Backspace
-        0x0F => 0x09,             // Tab
-        0x10 => 0x51,             // Q
-        0x11 => 0x57,             // W
-        0x12 => 0x45,             // E
-        0x13 => 0x52,             // R
-        0x14 => 0x54,             // T
-        0x15 => 0x59,             // Y
-        0x16 => 0x55,             // U
-        0x17 => 0x49,             // I
-        0x18 => 0x4F,             // O
-        0x19 => 0x50,             // P
-        0x1A => 0xDB,             // [
-        0x1B => 0xDD,             // ]
-        0x1C => 0x0D,             // Enter
-        0x1D => 0x11,             // Left Ctrl
-        0x1E => 0x41,             // A
-        0x1F => 0x53,             // S
-        0x20 => 0x44,             // D
-        0x21 => 0x46,             // F
-        0x22 => 0x47,             // G
-        0x23 => 0x48,             // H
-        0x24 => 0x4A,             // J
-        0x25 => 0x4B,             // K
-        0x26 => 0x4C,             // L
-        0x27 => 0xBA,             // ;
-        0x28 => 0xDE,             // '
-        0x29 => 0xC0,             // `
-        0x2A => 0x10,             // Left Shift
-        0x2B => 0xDC,             // \
-        0x2C => 0x5A,             // Z
-        0x2D => 0x58,             // X
-        0x2E => 0x43,             // C
-        0x2F => 0x56,             // V
-        0x30 => 0x42,             // B
-        0x31 => 0x4E,             // N
-        0x32 => 0x4D,             // M
-        0x33 => 0xBC,             // ,
-        0x34 => 0xBE,             // .
-        0x35 => 0xBF,             // /
-        0x36 => 0x10,             // Right Shift
-        0x38 => 0x12,             // Left Alt
-        0x39 => 0x20,             // Space
-        0x3A => 0x14,             // CapsLock
+        0x0B => 0x30,                   // 0
+        0x0C => 0xBD,                   // -
+        0x0D => 0xBB,                   // =
+        0x0E => 0x08,                   // Backspace
+        0x0F => 0x09,                   // Tab
+        0x10 => 0x51,                   // Q
+        0x11 => 0x57,                   // W
+        0x12 => 0x45,                   // E
+        0x13 => 0x52,                   // R
+        0x14 => 0x54,                   // T
+        0x15 => 0x59,                   // Y
+        0x16 => 0x55,                   // U
+        0x17 => 0x49,                   // I
+        0x18 => 0x4F,                   // O
+        0x19 => 0x50,                   // P
+        0x1A => 0xDB,                   // [
+        0x1B => 0xDD,                   // ]
+        0x1C => 0x0D,                   // Enter
+        0x1D => 0x11,                   // Left Ctrl
+        0x1E => 0x41,                   // A
+        0x1F => 0x53,                   // S
+        0x20 => 0x44,                   // D
+        0x21 => 0x46,                   // F
+        0x22 => 0x47,                   // G
+        0x23 => 0x48,                   // H
+        0x24 => 0x4A,                   // J
+        0x25 => 0x4B,                   // K
+        0x26 => 0x4C,                   // L
+        0x27 => 0xBA,                   // ;
+        0x28 => 0xDE,                   // '
+        0x29 => 0xC0,                   // `
+        0x2A => 0x10,                   // Left Shift
+        0x2B => 0xDC,                   // \
+        0x2C => 0x5A,                   // Z
+        0x2D => 0x58,                   // X
+        0x2E => 0x43,                   // C
+        0x2F => 0x56,                   // V
+        0x30 => 0x42,                   // B
+        0x31 => 0x4E,                   // N
+        0x32 => 0x4D,                   // M
+        0x33 => 0xBC,                   // ,
+        0x34 => 0xBE,                   // .
+        0x35 => 0xBF,                   // /
+        0x36 => 0x10,                   // Right Shift
+        0x38 => 0x12,                   // Left Alt
+        0x39 => 0x20,                   // Space
+        0x3A => 0x14,                   // CapsLock
         0x3B..=0x44 => scancode + 0x35, // F1-F10 -> VK_F1 0x70..VK_F10 0x79
-        0x45 => 0x90,             // NumLock
-        0x46 => 0x91,             // ScrollLock
-        0x47 => 0x24,             // Home (extended)
-        0x48 => 0x26,             // Up (extended; NOT numpad 8 / VK_NUMPAD8 0x68)
-        0x49 => 0x21,             // PageUp (extended)
-        0x4B => 0x25,             // Left (extended)
-        0x4D => 0x27,             // Right (extended)
-        0x4F => 0x23,             // End (extended)
-        0x50 => 0x28,             // Down (extended)
-        0x51 => 0x22,             // PageDown (extended)
-        0x52 => 0x2D,             // Insert (extended)
-        0x53 => 0x2E,             // Delete (extended)
-        0x57 => 0x7A,             // F11
-        0x58 => 0x7B,             // F12
+        0x45 => 0x90,                   // NumLock
+        0x46 => 0x91,                   // ScrollLock
+        0x47 => 0x24,                   // Home (extended)
+        0x48 => 0x26,                   // Up (extended; NOT numpad 8 / VK_NUMPAD8 0x68)
+        0x49 => 0x21,                   // PageUp (extended)
+        0x4B => 0x25,                   // Left (extended)
+        0x4D => 0x27,                   // Right (extended)
+        0x4F => 0x23,                   // End (extended)
+        0x50 => 0x28,                   // Down (extended)
+        0x51 => 0x22,                   // PageDown (extended)
+        0x52 => 0x2D,                   // Insert (extended)
+        0x53 => 0x2E,                   // Delete (extended)
+        0x57 => 0x7A,                   // F11
+        0x58 => 0x7B,                   // F12
         _ => return None,
     };
     Some(vk)
@@ -416,7 +416,9 @@ mod tests {
         // Numpad virtual keys are 0x60..0x69 (VK_NUMPAD0..VK_NUMPAD9); none of
         // the navigation scancodes may map into that range, which is what a
         // plain Set 1 -> numpad aliasing bug would produce.
-        let navigation = ["up", "down", "left", "right", "delete", "insert", "home", "end", "pageup", "pagedown"];
+        let navigation = [
+            "up", "down", "left", "right", "delete", "insert", "home", "end", "pageup", "pagedown",
+        ];
         for key in navigation {
             let vk = scancode_to_vk(key_scancode(key).expect("mapped")).expect("vk");
             assert!(

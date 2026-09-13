@@ -50,23 +50,25 @@ pub struct WindMouseParams {
 impl WindMouseParams {
     /// Randomizes the force constants so no two moves follow the same path.
     ///
-    /// Value ranges are taken from the DreamBot WindMouse variant.
-    pub fn randomized() -> Self {
+    /// Value ranges are taken from the DreamBot WindMouse variant. `speed`
+    /// scales every constant: above 1.0 the cursor is pulled harder and may
+    /// travel faster (fewer, larger steps), below 1.0 it crawls and wobbles.
+    pub fn randomized(speed: f64) -> Self {
         let mut rng = rand::rng();
         Self {
-            gravity: rng.random_range(4.0..20.0),
-            wind: rng.random_range(1.0..10.0),
-            max_velocity: rng.random_range(15.0 / 2.0..15.0),
+            gravity: rng.random_range(4.0..20.0) * speed,
+            wind: rng.random_range(1.0..10.0) * speed,
+            max_velocity: rng.random_range(15.0 / 2.0..15.0) * speed,
             distance_threshold: rng.random_range(5.0..25.0),
         }
     }
-}
 
-/// Time between two cursor updates.
-///
-/// Tuned near a real mouse's poll rate: the cursor visibly steps rather than
-/// teleporting, but a full-screen move still finishes quickly.
-pub const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+    /// The DreamBot defaults with no speed scaling.
+    #[cfg(test)]
+    fn randomized_default() -> Self {
+        Self::randomized(1.0)
+    }
+}
 
 /// Upper bound on simulated steps, so a degenerate force state can never spin
 /// forever. Far beyond the step count any real screen distance needs.
@@ -166,36 +168,114 @@ pub fn generate_path(start: Point, dest: Point, params: WindMouseParams) -> Vec<
     path
 }
 
+/// Sends `path` through `input`, one event per point, sleeping a jittered poll
+/// interval between events so the cadence is not a perfect metronome.
+///
+/// Bounded by [`MAX_MOVE_DURATION`]: the caller holds the input mutex for the whole
+/// move, so the loop stops early once the budget is spent. Returns the number of
+/// events sent; the caller is responsible for landing exactly on the destination
+/// when the budget cut the path short.
+fn dispatch_path<I: Mouse + ?Sized>(
+    input: &mut I,
+    path: &[Point],
+    mode: Coordinate,
+    step_interval: Duration,
+) -> Result<usize, InputError> {
+    let deadline = Instant::now() + MAX_MOVE_DURATION;
+    let mut rng = rand::rng();
+    let mut steps = 0;
+    for point in path {
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(step_interval + Duration::from_millis(rng.random_range(0..=4)));
+        input.move_mouse(point.x, point.y, mode)?;
+        steps += 1;
+    }
+    Ok(steps)
+}
+
 /// Moves `input`'s cursor to `dest` along a human-like WindMouse path.
 ///
 /// The current position is read from `input`, so callers need not track it.
 /// Returns the number of interpolation steps sent (0 if the cursor was already
 /// at `dest`). Blocking: call from a blocking thread.
 ///
+/// `speed` scales the force constants (see [`WindMouseParams::randomized`]) and
+/// `step_interval` is the base pause between cursor updates.
+///
 /// The move is bounded by [`MAX_MOVE_DURATION`]: the caller holds the input mutex for its
 /// whole duration, so the loop stops early once the budget is spent and closes the
 /// remaining distance in one final step.
-pub fn move_to<I: Mouse + ?Sized>(input: &mut I, dest: Point) -> Result<usize, InputError> {
+pub fn move_to<I: Mouse + ?Sized>(
+    input: &mut I,
+    dest: Point,
+    speed: f64,
+    step_interval: Duration,
+) -> Result<usize, InputError> {
     let (x, y) = input.location()?;
-    let path = generate_path(Point::new(x, y), dest, WindMouseParams::randomized());
+    let path = generate_path(Point::new(x, y), dest, WindMouseParams::randomized(speed));
 
-    let deadline = Instant::now() + MAX_MOVE_DURATION;
-    let mut rng = rand::rng();
-    let mut steps = 0;
-    for point in &path {
-        if Instant::now() >= deadline {
-            break;
-        }
-        // Jitter each interval so the update cadence is not a perfect metronome.
-        std::thread::sleep(MOUSE_POLL_INTERVAL + Duration::from_millis(rng.random_range(0..=4)));
-        input.move_mouse(point.x, point.y, Coordinate::Abs)?;
-        steps += 1;
-    }
+    let mut steps = dispatch_path(input, &path, Coordinate::Abs, step_interval)?;
 
     // The budget may have cut the path short; land exactly on the destination so callers
     // can rely on the cursor being where they asked.
     if steps < path.len() {
         input.move_mouse(dest.x, dest.y, Coordinate::Abs)?;
+        steps += 1;
+    }
+
+    Ok(steps)
+}
+
+/// Converts a cumulative path (positions measured from the origin) into per-step
+/// deltas, so it can be dispatched as relative events: a relative event moves the
+/// cursor *by* its argument, not *to* it, so sending the cumulative points would
+/// make the cursor travel the sum of every point and overshoot many times over.
+/// The deltas always sum back to the path's final point.
+fn path_to_deltas(path: &[Point]) -> Vec<Point> {
+    let mut previous = Point::new(0, 0);
+    path.iter()
+        .map(|point| {
+            let delta = Point::new(point.x - previous.x, point.y - previous.y);
+            previous = *point;
+            delta
+        })
+        .collect()
+}
+
+/// Moves `input`'s cursor by `delta` along a human-like WindMouse path of
+/// relative (mickey) events.
+///
+/// The path is simulated from the origin to `delta`, converted to per-step deltas
+/// and each step is dispatched as a raw `Coordinate::Rel` event, so a camera look
+/// or drag-orbit gets the same curved, accelerated motion as an absolute move
+/// instead of one instantaneous swing. Returns the number of interpolation steps
+/// sent (0 if `delta` is zero). Blocking: call from a blocking thread.
+///
+/// Bounded by [`MAX_MOVE_DURATION`] like [`move_to`]; when the budget runs out the
+/// remaining delta is closed in one final relative event. `speed` scales the force
+/// constants (see [`WindMouseParams::randomized`]) and `step_interval` is the base
+/// pause between cursor updates.
+pub fn move_by<I: Mouse + ?Sized>(
+    input: &mut I,
+    delta: Point,
+    speed: f64,
+    step_interval: Duration,
+) -> Result<usize, InputError> {
+    let path = generate_path(Point::new(0, 0), delta, WindMouseParams::randomized(speed));
+    let deltas = path_to_deltas(&path);
+
+    let mut steps = dispatch_path(input, &deltas, Coordinate::Rel, step_interval)?;
+
+    // The budget may have cut the path short; close only the remaining delta so
+    // callers can rely on the full delta having been sent, and no more.
+    if steps < deltas.len() {
+        let sent = path[steps - 1.min(path.len())];
+        let remaining = Point::new(delta.x - sent.x, delta.y - sent.y);
+        if remaining != Point::new(0, 0) {
+            input.move_mouse(remaining.x, remaining.y, Coordinate::Rel)?;
+        }
         steps += 1;
     }
 
@@ -264,7 +344,7 @@ mod tests {
     #[test]
     fn randomized_params_stay_in_the_documented_ranges() {
         for _ in 0..64 {
-            let params = WindMouseParams::randomized();
+            let params = WindMouseParams::randomized_default();
             assert!((4.0..20.0).contains(&params.gravity));
             assert!((1.0..10.0).contains(&params.wind));
             assert!((7.5..15.0).contains(&params.max_velocity));
@@ -273,8 +353,38 @@ mod tests {
     }
 
     #[test]
+    fn speed_multiplier_scales_the_force_constants() {
+        for _ in 0..64 {
+            let params = WindMouseParams::randomized(4.0);
+            assert!((16.0..80.0).contains(&params.gravity));
+            assert!((4.0..40.0).contains(&params.wind));
+            assert!((30.0..60.0).contains(&params.max_velocity));
+            // The settle threshold is a distance, not a speed: unscaled.
+            assert!((5.0..25.0).contains(&params.distance_threshold));
+        }
+    }
+
+    #[test]
     fn distance_to_uses_euclidean_geometry() {
         assert_eq!(Point::new(0, 0).distance_to(Point::new(3, 4)), 5.0);
         assert_eq!(Point::new(10, 10).distance_to(Point::new(10, 10)), 0.0);
+    }
+
+    #[test]
+    fn deltas_sum_back_to_the_final_path_point() {
+        let path = generate_path(Point::new(0, 0), Point::new(800, -450), fixed_params());
+        let deltas = path_to_deltas(&path);
+
+        assert_eq!(deltas.len(), path.len());
+        let total = deltas.iter().fold(Point::new(0, 0), |acc, d| {
+            Point::new(acc.x + d.x, acc.y + d.y)
+        });
+        assert_eq!(total, path.last().copied().unwrap());
+    }
+
+    #[test]
+    fn deltas_of_a_single_point_path_match_the_point() {
+        let deltas = path_to_deltas(&[Point::new(12, -7)]);
+        assert_eq!(deltas, vec![Point::new(12, -7)]);
     }
 }

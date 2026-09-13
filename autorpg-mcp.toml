@@ -57,15 +57,19 @@ max_wait_ms = 60000
 # coordinates land correctly.
 reference_aspect_ratio = 1.7777777777777777
 
+[mouse]
+# Speed multiplier for human-like (WindMouse) mouse moves. Scales the algorithm's
+# force constants: above 1.0 moves faster and straighter, below 1.0 slower and
+# wobblier. 1.0 matches the algorithm's defaults.
+speed_multiplier = 1.5
+
+# Base time between two cursor updates in a human-like move, in milliseconds.
+# Lower values dispatch the same path in less wall-clock time.
+step_interval_ms = 8
+
 [prompts]
 # Path to the prompt instructions template, relative to this configuration file's
 # directory. {target}, {duration} and {potion_threshold} placeholders are
 # substituted per prompt call; the file is re-read on every call, so edits apply
 # without a restart.
 instructions_path = "ai_instructions.md"
-
-[session]
-# Initial session state published before any tool call arrives.
-initial_hp = 100
-initial_stamina = 100
-initial_location = "Starter Village"

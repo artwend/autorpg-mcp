@@ -17,10 +17,66 @@ use crate::config::ServerConfig;
 use crate::error::{input_error, internal_error, invalid_params};
 use crate::games::Resolution;
 use crate::input::{direction_scancode, key_scancode, ops};
-use crate::state::{
-    SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons, SharedSession,
-};
+use crate::state::{SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons, SharedSession};
 use crate::windmouse;
+
+/// Deserializes a number from either a JSON number or a numeric string.
+///
+/// MCP prompt arguments are transmitted as strings (the protocol's `PromptArgument`
+/// carries no type), and some clients stringify tool arguments too, so a bare
+/// `u32`/`i32`/`u64` field would otherwise reject `"10"` with
+/// `invalid type: string "10", expected u32`. This accepts both forms and also works
+/// for `Option<T>` fields (a JSON `null` or a missing field yields `None`).
+fn deserialize_number<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let coerced = match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if let Ok(number) = text.parse::<i64>() {
+                serde_json::Value::from(number)
+            } else if let Ok(number) = text.parse::<u64>() {
+                serde_json::Value::from(number)
+            } else if let Ok(number) = text.parse::<f64>() {
+                serde_json::Number::from_f64(number)
+                    .map(serde_json::Value::Number)
+                    .ok_or_else(|| D::Error::custom(format!("invalid number: {text:?}")))?
+            } else {
+                return Err(D::Error::custom(format!("invalid number: {text:?}")));
+            }
+        }
+        other => other,
+    };
+    serde_json::from_value(coerced).map_err(D::Error::custom)
+}
+
+/// Deserializes a boolean from either a JSON boolean or a string ("true"/"false").
+///
+/// Same rationale as [`deserialize_number`]: prompt arguments arrive as strings.
+fn deserialize_bool<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    use serde::de::Error as _;
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let coerced = match value {
+        serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => serde_json::Value::Bool(true),
+            "false" | "0" | "no" | "off" => serde_json::Value::Bool(false),
+            _ => return Err(D::Error::custom(format!("invalid boolean: {text:?}"))),
+        },
+        other => other,
+    };
+    serde_json::from_value(coerced).map_err(D::Error::custom)
+}
+
 /// Application context shared by all MCP tools.
 pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     session: SharedSession,
@@ -35,6 +91,10 @@ pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     limits: ServerConfig,
     /// Quality of the on-demand JPEG encode, from the capture configuration.
     jpeg_quality: u8,
+    /// Speed multiplier for human-like mouse moves, from the configuration file.
+    mouse_speed: f64,
+    /// Base pause between cursor updates in a human-like mouse move.
+    mouse_step_interval: Duration,
     /// Path of the prompt instructions template, resolved against the configuration
     /// file's directory. Re-read on every prompt call so edits apply without a restart.
     instructions_path: std::path::PathBuf,
@@ -51,6 +111,7 @@ pub struct MovePlayerArgs {
     /// Movement direction: "forward" (W), "back" (S), "left" (A) or "right" (D)
     direction: String,
     /// How long to hold the movement key in milliseconds (default 500, max 10000)
+    #[serde(default, deserialize_with = "deserialize_number")]
     duration_ms: Option<u64>,
 }
 
@@ -59,6 +120,7 @@ pub struct PressKeyArgs {
     /// The key to press: a single character (e.g. "e", "1", " ") or a named key (e.g. "space", "enter", "escape", "tab", "f1")
     key: String,
     /// How long to hold the key in milliseconds (default 50, max 10000)
+    #[serde(default, deserialize_with = "deserialize_number")]
     duration_ms: Option<u64>,
 }
 
@@ -72,16 +134,21 @@ pub struct InputTextArgs {
 pub struct MoveMouseArgs {
     /// Target X coordinate in captured-frame (image) pixels; scaled to native display pixels.
     /// Ignored for relative moves (raw delta in image pixels).
+    #[serde(deserialize_with = "deserialize_number")]
     x: i32,
     /// Target Y coordinate in captured-frame (image) pixels; scaled to native display pixels.
     /// Ignored for relative moves (raw delta in image pixels).
+    #[serde(deserialize_with = "deserialize_number")]
     y: i32,
     /// If true, the coordinates are a raw delta applied to the current cursor position
     /// (no scaling; for camera look, aiming and other mickey-based camera control)
+    #[serde(default, deserialize_with = "deserialize_bool")]
     relative: Option<bool>,
-    /// If true (the default), an absolute move travels along a human-like WindMouse
-    /// path (curved, accelerated and settled) instead of jumping straight to the
-    /// target. Set to false for a single instantaneous move.
+    /// If true (the default), a move travels along a human-like WindMouse path
+    /// (curved, accelerated and settled) instead of jumping straight to the
+    /// target. Applies to both absolute and relative moves. Set to false for a
+    /// single instantaneous move.
+    #[serde(default, deserialize_with = "deserialize_bool")]
     human_like: Option<bool>,
 }
 
@@ -90,6 +157,7 @@ pub struct ClickMouseArgs {
     /// Mouse button to click: "left" (default), "right" or "middle"
     button: Option<String>,
     /// If true, perform a double click
+    #[serde(default, deserialize_with = "deserialize_bool")]
     double: Option<bool>,
 }
 
@@ -101,18 +169,21 @@ pub struct HoldMouseArgs {
     /// (keep the button held down) or "release" (release a held button)
     action: Option<String>,
     /// How long to hold the button in milliseconds for the "hold" action (default 50, max 10000)
+    #[serde(default, deserialize_with = "deserialize_number")]
     duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ScrollMouseArgs {
     /// Scroll amount in wheel clicks; positive scrolls up, negative scrolls down
+    #[serde(deserialize_with = "deserialize_number")]
     amount: i32,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct WaitArgs {
     /// How long to wait in milliseconds (default 500, max from the server's max_wait_ms limit)
+    #[serde(default, deserialize_with = "deserialize_number")]
     duration_ms: Option<u64>,
     /// Optional note about what this delay is for (e.g. "loading screen", "death respawn"); recorded in the session log
     reason: Option<String>,
@@ -123,16 +194,19 @@ pub struct CaptureScreenArgs {
     /// When true, skip the wait-for-change window and return the latest frame immediately,
     /// even if the screen has not visibly changed. Use this to inspect static screens
     /// (menus, dialogue, inventory) that would otherwise time out without an image.
+    #[serde(default, deserialize_with = "deserialize_bool")]
     force: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct StartFarmArgs {
     /// How long to farm in minutes (default 10)
+    #[serde(default, deserialize_with = "deserialize_number")]
     duration_minutes: Option<u32>,
     /// Mob type to focus on (e.g. "boar", "wolf"); empty means any nearby mob
     target: Option<String>,
     /// HP percentage at which to drink a potion (default 30)
+    #[serde(default, deserialize_with = "deserialize_number")]
     potion_threshold: Option<i32>,
 }
 
@@ -147,6 +221,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         held_buttons: SharedHeldButtons,
         limits: ServerConfig,
         jpeg_quality: u8,
+        mouse_speed: f64,
+        mouse_step_interval: Duration,
         instructions_path: std::path::PathBuf,
     ) -> Self {
         Self {
@@ -157,6 +233,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             held_buttons,
             limits,
             jpeg_quality,
+            mouse_speed,
+            mouse_step_interval,
             instructions_path,
         }
     }
@@ -216,15 +294,14 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         // The JPEG is encoded on demand (the capture thread no longer pre-encodes). A
         // timed-out (static) capture returns no image, so skip the encode entirely
         // instead of paying for it only to discard the result.
-        let jpeg = if timed_out {
-            None
-        } else {
-            Some(
-                frame
-                    .encode_jpeg(self.jpeg_quality)
-                    .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?,
-            )
-        };
+        let jpeg =
+            if timed_out {
+                None
+            } else {
+                Some(frame.encode_jpeg(self.jpeg_quality).map_err(|error| {
+                    internal_error(format!("failed to encode preview: {error}"))
+                })?)
+            };
         drop(session);
 
         let combat_text = if metrics.in_combat { "IN" } else { "OUT" };
@@ -435,11 +512,13 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     ///
     /// Absolute moves are human-like by default: the path is interpolated with the
     /// WindMouse algorithm ([`crate::windmouse`]) so aiming looks like a person moving a
-    /// mouse instead of a cursor landing on the target in one event. Pass
-    /// `human_like: false` for a single instantaneous move, and keep relative moves
-    /// (camera look, drag-orbit) at their raw mickey deltas in one event.
+    /// mouse instead of a cursor landing on the target in one event. Relative moves
+    /// (camera look, drag-orbit) are interpolated the same way: the delta is simulated
+    /// as a curved path of raw mickey events, so a look sweeps like a person turning
+    /// the camera instead of snapping. Pass `human_like: false` for a single
+    /// instantaneous event in either mode.
     #[tool(
-        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or by a raw unscaled delta relative to its current position. Absolute moves follow a human-like WindMouse path by default; pass human_like: false for an instant move."
+        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or by a delta relative to its current position. Both modes follow a human-like WindMouse path by default; pass human_like: false for an instant move."
     )]
     async fn move_mouse(
         &self,
@@ -480,6 +559,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         };
 
         let input = Arc::clone(&self.input);
+        let mouse_speed = self.mouse_speed;
+        let mouse_step_interval = self.mouse_step_interval;
         let (target, final_position, steps) =
             tokio::task::spawn_blocking(move || -> MouseMoveResult {
                 let mut simulator = input.lock().map_err(|e| e.to_string())?;
@@ -492,19 +573,36 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                     )
                 };
 
-                let steps = if relative {
-                    // Camera look consumes raw mickey deltas; interpolating them would
-                    // turn one look into a swing, so a relative move stays one event.
-                    simulator
-                        .move_mouse(target_x, target_y, Coordinate::Rel)
-                        .map_err(|e| e.to_string())?;
-                    1
-                } else if human_like {
-                    windmouse::move_to(&mut *simulator, windmouse::Point::new(target_x, target_y))
+                let steps = if human_like {
+                    // Both modes are interpolated: absolute moves walk a curved path of
+                    // absolute events, relative moves a curved path of raw mickey events
+                    // (each step is a delta, so the simulation runs from the origin).
+                    // Speed and step cadence come from the configuration file.
+                    if relative {
+                        windmouse::move_by(
+                            &mut *simulator,
+                            windmouse::Point::new(target_x, target_y),
+                            mouse_speed,
+                            mouse_step_interval,
+                        )
                         .map_err(|e| e.to_string())?
+                    } else {
+                        windmouse::move_to(
+                            &mut *simulator,
+                            windmouse::Point::new(target_x, target_y),
+                            mouse_speed,
+                            mouse_step_interval,
+                        )
+                        .map_err(|e| e.to_string())?
+                    }
                 } else {
+                    let mode = if relative {
+                        Coordinate::Rel
+                    } else {
+                        Coordinate::Abs
+                    };
                     simulator
-                        .move_mouse(target_x, target_y, Coordinate::Abs)
+                        .move_mouse(target_x, target_y, mode)
                         .map_err(|e| e.to_string())?;
                     1
                 };
@@ -517,10 +615,18 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             .map_err(input_error)?;
 
         let message = if relative {
-            format!(
-                "Mouse moved by relative delta ({}, {}); now at cursor ({}, {}).",
-                x, y, final_position.0, final_position.1
-            )
+            if human_like {
+                format!(
+                    "Mouse moved along a {steps}-step WindMouse path by relative delta ({}, {}); \
+                     now at cursor ({}, {}).",
+                    x, y, final_position.0, final_position.1
+                )
+            } else {
+                format!(
+                    "Mouse moved by relative delta ({}, {}); now at cursor ({}, {}).",
+                    x, y, final_position.0, final_position.1
+                )
+            }
         } else if human_like {
             format!(
                 "Mouse moved along a {steps}-step WindMouse path to image ({}, {}) -> \

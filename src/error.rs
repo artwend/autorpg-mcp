@@ -1,7 +1,7 @@
 //! Helpers for building MCP `ErrorData` values.
 
-use rmcp::model::ErrorCode;
 use rmcp::ErrorData as McpError;
+use rmcp::model::ErrorCode;
 
 /// Wraps an input-simulation failure as an internal MCP error.
 pub fn input_error(message: impl std::fmt::Display) -> McpError {

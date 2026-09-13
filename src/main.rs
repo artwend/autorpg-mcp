@@ -32,11 +32,9 @@ use windows_capture::{
 // };
 
 use capture::{CaptureFlags, CaptureReceiver};
-use config::{Config, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH};
+use config::{CONFIG_PATH_ENV, Config, DEFAULT_CONFIG_PATH};
 use server::GameServer;
-use state::{
-    GameMetrics, SessionState, SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons,
-};
+use state::{GameMetrics, SessionState, SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons};
 
 // Per-monitor-v2 DPI awareness so `GetSystemMetrics` (and therefore the input
 // backend's `main_display`) reports physical monitor pixels instead of
@@ -57,9 +55,7 @@ const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 fn set_process_dpi_awareness() {
     // The return value is only an error when awareness was already set (e.g. by
     // a manifest), in which case nothing needs to change.
-    let _ = unsafe {
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
 /// Builds the capture settings for `source` and starts the capture thread.
@@ -188,13 +184,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize in-memory session parameters
     let session_state = RwLock::new(SessionState {
         current_metrics: GameMetrics {
-            player_hp: config.session.initial_hp,
-            stamina: config.session.initial_stamina,
+            player_hp: 100,
+            stamina: 100,
             q_ready: true,
             r_ready: true,
             f_ready: true,
             g_ready: true,
-            location: config.session.initial_location.clone(),
+            location: "Unknown".to_string(),
             in_combat: false,
         },
         active_game: Arc::new(games::action_rpg::ActionRPG::new(
@@ -221,13 +217,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // so we never pay for callbacks whose frames get dropped anyway. The setting is advisory
     // and unsupported on older builds, hence the capability check; `CaptureReceiver` also paces
     // itself, so falling back to the default interval only costs a little idle CPU.
-    let minimum_update_interval = if GraphicsCaptureApi::is_minimum_update_interval_supported()
-        .unwrap_or(false)
-    {
-        MinimumUpdateIntervalSettings::Custom(config.capture.os_update_hint())
-    } else {
-        MinimumUpdateIntervalSettings::Default
-    };
+    let minimum_update_interval =
+        if GraphicsCaptureApi::is_minimum_update_interval_supported().unwrap_or(false) {
+            MinimumUpdateIntervalSettings::Custom(config.capture.os_update_hint())
+        } else {
+            MinimumUpdateIntervalSettings::Default
+        };
 
     let cursor_settings = if config.capture.with_cursor {
         CursorCaptureSettings::WithCursor
@@ -274,6 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         held_buttons,
         config.server,
         config.capture.sanitized_jpeg_quality(),
+        config.mouse.sanitized_speed_multiplier(),
+        config.mouse.step_interval(),
         instructions_path,
     );
     let service = server.serve(rmcp::transport::stdio()).await?;

@@ -48,8 +48,14 @@ input-simulator = { git = "https://github.com/artwend/input-simulator", optional
 # The capture thread runs a tight per-frame loop (staging map, downsample, pixel
 # repack) on every compositor update. An unoptimized build executes that loop
 # roughly 50x slower and pins a core, so the binary the MCP client launches must
-# always be the release build. These settings widen cross-crate inlining into the
-# capture pipeline, which is where the remaining per-frame cost lives.
+# always be the release build. `dev` mirrors the release settings so a plain
+# `cargo build`/`cargo run` produces release semantics (`--release` is then a
+# no-op except for directory naming).
+[profile.dev]
+opt-level = 3
+codegen-units = 1
+lto = true
+
 [profile.release]
 codegen-units = 1
 lto = true
