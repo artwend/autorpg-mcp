@@ -254,6 +254,24 @@ pub mod ops {
     #[cfg(feature = "input-simulator")]
     use crate::input::scancode_to_vk;
 
+    /// Reports whether `scancode` can be dispatched by the active backend.
+    ///
+    /// The enigo backend accepts every Set 1 scancode, but the input-simulator
+    /// backend works in virtual-key space, so a scancode with no virtual-key
+    /// equivalent cannot be sent. Checking this from the async tool handler, before
+    /// the blocking task is spawned, lets the failure surface as an
+    /// `INVALID_PARAMS` error instead of an internal one.
+    #[cfg(not(feature = "input-simulator"))]
+    pub fn scancode_supported(_scancode: u16) -> bool {
+        true
+    }
+
+    /// Reports whether `scancode` can be dispatched by the active backend.
+    #[cfg(feature = "input-simulator")]
+    pub fn scancode_supported(scancode: u16) -> bool {
+        scancode_to_vk(scancode).is_some()
+    }
+
     /// Presses a raw key, waits, then releases it (blocking; call from a blocking thread).
     ///
     /// `scancode` is a PS/2 Set 1 scancode as produced by [`key_scancode`] and

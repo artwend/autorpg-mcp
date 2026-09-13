@@ -18,6 +18,7 @@ use crate::error::{input_error, internal_error, invalid_params};
 use crate::games::Resolution;
 use crate::input::{direction_scancode, key_scancode, ops};
 use crate::state::{SharedFrameBuffer, SharedFrameNotify, SharedSession};
+use crate::windmouse;
 /// Application context shared by all MCP tools.
 #[derive(Clone)]
 pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
@@ -29,9 +30,6 @@ pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     input: Arc<Mutex<Input>>,
     /// Tool limits loaded from the configuration file.
     limits: ServerConfig,
-    /// Longest edge of the published preview, from the capture configuration; image-space
-    /// mouse coordinates are scaled up to native display pixels with it.
-    preview_edge: u32,
     /// Quality of the on-demand JPEG encode, from the capture configuration.
     jpeg_quality: u8,
     /// Path of the prompt instructions template, resolved against the configuration
@@ -78,6 +76,10 @@ pub struct MoveMouseArgs {
     /// If true, the coordinates are a raw delta applied to the current cursor position
     /// (no scaling; for camera look, aiming and other mickey-based camera control)
     relative: Option<bool>,
+    /// If true (the default), an absolute move travels along a human-like WindMouse
+    /// path (curved, accelerated and settled) instead of jumping straight to the
+    /// target. Set to false for a single instantaneous move.
+    human_like: Option<bool>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -140,7 +142,6 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         frame_notify: SharedFrameNotify,
         input: Input,
         limits: ServerConfig,
-        preview_edge: u32,
         jpeg_quality: u8,
         instructions_path: std::path::PathBuf,
     ) -> Self {
@@ -150,7 +151,6 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             frame_notify,
             input: Arc::new(Mutex::new(input)),
             limits,
-            preview_edge,
             jpeg_quality,
             instructions_path,
         }
@@ -214,18 +214,26 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             }
 
             // The JPEG is encoded on demand (the capture thread no longer pre-encodes) and
-            // handed out so the lock can be dropped before the base64 encode below.
-            let jpeg = frame
-                .encode_jpeg(self.jpeg_quality)
-                .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?;
+            // handed out so the lock can be dropped before the base64 encode below. A
+            // timed-out (static) capture returns no image, so skip the encode entirely
+            // instead of paying for it under the locks only to discard the result.
+            let jpeg = if timed_out {
+                None
+            } else {
+                Some(
+                    frame
+                        .encode_jpeg(self.jpeg_quality)
+                        .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?,
+                )
+            };
             (metrics, jpeg)
         };
 
         let metrics = telemetry;
         let telemetry_text = format!(
-            "[HP: {}% | Stamina: {}% | Q: {} | R: {} | F: {} | Zone: {}]",
-            metrics.player_hp,
-            metrics.stamina,
+            "[HP: {} | Stamina: {} | Q: {} | R: {} | F: {} | Zone: {}]",
+            Self::format_percent(metrics.player_hp),
+            Self::format_percent(metrics.stamina),
             Self::format_ability(metrics.q_ready),
             Self::format_ability(metrics.r_ready),
             Self::format_ability(metrics.f_ready),
@@ -243,6 +251,8 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             ))]));
         }
 
+        // `timed_out` returned above, so a JPEG is always present here.
+        let jpeg = jpeg.ok_or_else(|| internal_error("missing preview for a captured frame"))?;
         let img_base64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
         Ok(CallToolResult::success(vec![
             ContentBlock::text(format!("Frame captured. Telemetry: {telemetry_text}")),
@@ -253,6 +263,17 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     /// Formats an ability readiness flag as READY or COOLDOWN for telemetry text.
     fn format_ability(ready: bool) -> &'static str {
         if ready { "READY" } else { "COOLDOWN" }
+    }
+
+    /// Formats a bar percentage for telemetry text. A negative value marks a bar the
+    /// parser could not measure (`UNKNOWN_PERCENT`); rendering it as `?` keeps the model
+    /// from mistaking a failed scan for a full bar.
+    fn format_percent(value: i32) -> String {
+        if value < 0 {
+            "?".to_string()
+        } else {
+            format!("{value}%")
+        }
     }
 
     /// Updates the active zone identifier when entering a new area.
@@ -298,6 +319,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 direction
             ))
         })?;
+        ensure_scancode_supported(scancode)?;
         let duration =
             Duration::from_millis(duration_ms.unwrap_or(500).min(self.limits.max_hold_ms));
 
@@ -340,6 +362,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 key
             ))
         })?;
+        ensure_scancode_supported(scancode)?;
         let duration =
             Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
 
@@ -392,65 +415,104 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
 
     /// Moves the mouse cursor to absolute (or relative) screen coordinates.
     ///
-    /// Absolute coordinates are in the captured frame's image space (the preview scaled to
-    /// the configured preview edge on its longest edge) and are scaled up to native display
-    /// pixels before the move, so a position picked off the image lands on the same
-    /// physical spot. The process runs with per-monitor DPI awareness, so the display
-    /// dimensions used for that scaling are physical pixels, matching what
-    /// windows-capture captures. Relative coordinates are raw mickey deltas passed
-    /// through unscaled: camera look operates on deltas, not image offsets.
+    /// Absolute coordinates are in the captured frame's image space (the captured source
+    /// scaled to the configured preview edge on its longest edge) and are scaled up by the
+    /// source's own pixel dimensions — read out of the latest published frame — before the
+    /// move, so a position picked off the image lands on the same physical spot. Using the
+    /// source (monitor or window) rather than the display keeps the mapping correct when
+    /// `capture.target = "window"`, where the captured area is smaller than the monitor.
+    /// The process runs with per-monitor DPI awareness, so source pixels are physical
+    /// pixels, matching what windows-capture captures.
+    ///
+    /// Absolute moves are sent as `Coordinate::Abs` because `MOUSEEVENTF_ABSOLUTE` (which
+    /// enigo emits for it) reports the true mouse position, whereas this backend's other
+    /// path is not a plain `MOUSEEVENTF_MOVE` relative event: with
+    /// `windows_subject_to_mouse_speed_and_acceleration_level = false` (the crate default)
+    /// enigo resolves `Coordinate::Rel` by reading the cursor and recursing back into the
+    /// absolute path, which would make a relative move carry absolute-position noise into
+    /// a game's camera. `Coordinate::Abs` is also free of the OS pointer-acceleration
+    /// curve.
+    ///
+    /// Absolute moves are human-like by default: the path is interpolated with the
+    /// WindMouse algorithm ([`crate::windmouse`]) so aiming looks like a person moving a
+    /// mouse instead of a cursor landing on the target in one event. Pass
+    /// `human_like: false` for a single instantaneous move, and keep relative moves
+    /// (camera look, drag-orbit) at their raw mickey deltas in one event.
     #[tool(
-        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or by a raw unscaled delta relative to its current position."
+        description = "Moves the mouse cursor to absolute image-space coordinates (auto-scaled to native display pixels), or by a raw unscaled delta relative to its current position. Absolute moves follow a human-like WindMouse path by default; pass human_like: false for an instant move."
     )]
     async fn move_mouse(
         &self,
-        Parameters(MoveMouseArgs { x, y, relative }): Parameters<MoveMouseArgs>,
+        Parameters(MoveMouseArgs {
+            x,
+            y,
+            relative,
+            human_like,
+        }): Parameters<MoveMouseArgs>,
     ) -> Result<CallToolResult, McpError> {
         let relative = relative.unwrap_or(false);
-        let coordinate = if relative {
-            Coordinate::Rel
-        } else {
-            Coordinate::Abs
-        };
-        let (image_x, image_y) = (x, y);
+        let human_like = human_like.unwrap_or(true);
 
-        let preview_edge = self.preview_edge as f64;
+        // Absolute: image-space coordinates are scaled up to the captured source's pixel
+        // dimensions. The scale is taken from the latest published frame (native source
+        // size over published preview size), which stays correct for window capture and
+        // for sources below the preview ceiling (never upscaled); with no frame yet there
+        // is nothing to aim at, so the call fails instead of guessing. Relative: pass the
+        // raw delta through unscaled, since game cameras consume mickey deltas, not
+        // image-space offsets.
+        let scale = if relative {
+            1.0
+        } else {
+            // Frame lock only, never held across an await: the closure below runs on a
+            // blocking thread.
+            let guard = match self.frame_buffer.lock() {
+                Ok(lock) => lock,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let frame = guard.as_ref().ok_or_else(|| {
+                invalid_params("No frame captured yet; call capture_screen first.")
+            })?;
+            let preview_longest = frame.width.max(frame.height) as f64;
+            let source_longest = frame.source_width.max(frame.source_height) as f64;
+            if preview_longest > 0.0 {
+                source_longest / preview_longest
+            } else {
+                1.0
+            }
+        };
+
         let input = Arc::clone(&self.input);
-        let (target, native, final_position) =
+        let (target, final_position, steps) =
             tokio::task::spawn_blocking(move || -> MouseMoveResult {
                 let mut simulator = input.lock().map_err(|e| e.to_string())?;
-
-                // Absolute: image-space coordinates must be scaled up to native display
-                // pixels before the move. Relative: pass the raw delta through unscaled,
-                // since game cameras consume mickey deltas, not image-space offsets.
-                let (target_x, target_y, native) = if relative {
-                    (x, y, (0, 0))
+                let (target_x, target_y) = if relative {
+                    (x, y)
                 } else {
-                    // The capture pipeline publishes a preview scaled to the configured
-                    // preview edge on its longest edge (never upscaled), so image-space
-                    // coordinates must be scaled up to native display pixels before the
-                    // move. With DPI awareness set the display dimensions are physical
-                    // pixels, matching the captured frame.
-                    let (native_w, native_h) =
-                        simulator.main_display().map_err(|e| e.to_string())?;
-                    let longest = native_w.max(native_h);
-                    let scale = if longest as f64 > preview_edge {
-                        longest as f64 / preview_edge
-                    } else {
-                        1.0
-                    };
                     (
                         (x as f64 * scale).round() as i32,
                         (y as f64 * scale).round() as i32,
-                        (native_w, native_h),
                     )
                 };
 
-                simulator
-                    .move_mouse(target_x, target_y, coordinate)
-                    .map_err(|e| e.to_string())?;
+                let steps = if relative {
+                    // Camera look consumes raw mickey deltas; interpolating them would
+                    // turn one look into a swing, so a relative move stays one event.
+                    simulator
+                        .move_mouse(target_x, target_y, Coordinate::Rel)
+                        .map_err(|e| e.to_string())?;
+                    1
+                } else if human_like {
+                    windmouse::move_to(&mut *simulator, windmouse::Point::new(target_x, target_y))
+                        .map_err(|e| e.to_string())?
+                } else {
+                    simulator
+                        .move_mouse(target_x, target_y, Coordinate::Abs)
+                        .map_err(|e| e.to_string())?;
+                    1
+                };
+
                 let final_position = simulator.location().map_err(|e| e.to_string())?;
-                Ok(((target_x, target_y), native, final_position))
+                Ok(((target_x, target_y), final_position, steps))
             })
             .await
             .map_err(input_error)?
@@ -459,20 +521,19 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let message = if relative {
             format!(
                 "Mouse moved by relative delta ({}, {}); now at cursor ({}, {}).",
-                image_x, image_y, final_position.0, final_position.1
+                x, y, final_position.0, final_position.1
+            )
+        } else if human_like {
+            format!(
+                "Mouse moved along a {steps}-step WindMouse path to image ({}, {}) -> \
+                 native ({}, {}) (scale {:.3}); now at cursor ({}, {}).",
+                x, y, target.0, target.1, scale, final_position.0, final_position.1
             )
         } else {
             format!(
-                "Mouse moved to image ({}, {}) -> native ({}, {}) on a {}x{} display; \
+                "Mouse moved to image ({}, {}) -> native ({}, {}) (scale {:.3}); \
                  now at cursor ({}, {}).",
-                image_x,
-                image_y,
-                target.0,
-                target.1,
-                native.0,
-                native.1,
-                final_position.0,
-                final_position.1
+                x, y, target.0, target.1, scale, final_position.0, final_position.1
             )
         };
         self.session.write().await.record_event(message.clone());
@@ -538,16 +599,15 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         }): Parameters<HoldMouseArgs>,
     ) -> Result<CallToolResult, McpError> {
         let button = parse_button(button.as_deref())?;
-        let action = action.unwrap_or_else(|| "hold".to_string()).to_lowercase();
+        let action = parse_hold_action(action.as_deref())?;
         let duration =
             Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
 
         let input = Arc::clone(&self.input);
-        let action_task = action.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut simulator = input.lock().map_err(|e| e.to_string())?;
-            match action_task.as_str() {
-                "hold" => {
+            match action {
+                HoldAction::Hold => {
                     simulator
                         .button(button, Direction::Press)
                         .map_err(|e| e.to_string())?;
@@ -556,29 +616,26 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                         .button(button, Direction::Release)
                         .map_err(|e| e.to_string())
                 }
-                "press" => simulator
+                HoldAction::Press => simulator
                     .button(button, Direction::Press)
                     .map_err(|e| e.to_string()),
-                "release" => simulator
+                HoldAction::Release => simulator
                     .button(button, Direction::Release)
                     .map_err(|e| e.to_string()),
-                _ => Err(format!(
-                    "invalid action: {}. Use hold/press/release.",
-                    action_task
-                )),
             }
         })
         .await
         .map_err(input_error)?
         .map_err(input_error)?;
 
-        let message = match action.as_str() {
-            "hold" => format!(
+        let message = match action {
+            HoldAction::Hold => format!(
                 "Held {:?} mouse button for {} ms, then released.",
                 button,
                 duration.as_millis()
             ),
-            other => format!("Mouse button {:?} {}ed.", button, other),
+            HoldAction::Press => format!("Mouse button {button:?} pressed (held down)."),
+            HoldAction::Release => format!("Mouse button {button:?} released."),
         };
         self.session.write().await.record_event(message.clone());
 
@@ -659,9 +716,51 @@ fn parse_button(button: Option<&str>) -> Result<Button, McpError> {
     }
 }
 
-/// Spawn-blocking result of a mouse move: `(target, native display size, cursor
-/// position after the move)`.
-type MouseMoveResult = Result<((i32, i32), (i32, i32), (i32, i32)), String>;
+/// Rejects a scancode the active input backend cannot dispatch.
+///
+/// The enigo backend accepts every Set 1 scancode, but the input-simulator backend
+/// works in virtual-key space, so a scancode without a virtual-key equivalent is an
+/// invalid argument rather than an internal failure.
+fn ensure_scancode_supported(scancode: u16) -> Result<(), McpError> {
+    if ops::scancode_supported(scancode) {
+        Ok(())
+    } else {
+        Err(invalid_params(format!(
+            "Scancode 0x{scancode:X} cannot be sent by the active input backend."
+        )))
+    }
+}
+
+/// Action requested by `hold_mouse`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldAction {
+    /// Press, wait `duration_ms`, release.
+    Hold,
+    /// Keep the button held down.
+    Press,
+    /// Release a held button.
+    Release,
+}
+
+/// Parses a tool's hold action argument into a [`HoldAction`].
+///
+/// Validated before the blocking task is spawned so a bad argument is an
+/// `INVALID_PARAMS` error rather than an internal one surfaced from the worker.
+fn parse_hold_action(action: Option<&str>) -> Result<HoldAction, McpError> {
+    match action.unwrap_or("hold").to_lowercase().as_str() {
+        "hold" => Ok(HoldAction::Hold),
+        "press" => Ok(HoldAction::Press),
+        "release" => Ok(HoldAction::Release),
+        other => Err(invalid_params(format!(
+            "Invalid action: {}. Use hold/press/release.",
+            other
+        ))),
+    }
+}
+
+/// Spawn-blocking result of a mouse move: `(target in native source pixels, cursor
+/// position after the move, number of interpolation steps sent)`.
+type MouseMoveResult = Result<((i32, i32), (i32, i32), usize), String>;
 
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     /// Waits until the screen visibly changes or the wait times out.

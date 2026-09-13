@@ -14,10 +14,10 @@ pub fn input_error(message: impl std::fmt::Display) -> McpError {
 
 /// Wraps an invalid tool argument as an invalid-params MCP error.
 pub fn invalid_params(message: impl std::fmt::Display) -> McpError {
-    McpError::new(ErrorCode::INVALID_PARAMS, format!("{}", message), None)
+    McpError::new(ErrorCode::INVALID_PARAMS, message.to_string(), None)
 }
 
 /// Wraps an internal (serialization/IO) failure as an internal MCP error.
 pub fn internal_error(message: impl std::fmt::Display) -> McpError {
-    McpError::new(ErrorCode::INTERNAL_ERROR, format!("{}", message), None)
+    McpError::new(ErrorCode::INTERNAL_ERROR, message.to_string(), None)
 }

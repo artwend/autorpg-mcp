@@ -11,7 +11,10 @@ input-simulator = ["dep:input-simulator"]
 # Official Model Context Protocol SDK for Rust
 # "transport-io" enables the stdio() transport used by the server
 rmcp = { version = "3.2", features = ["server", "transport-io"] }
-tokio = { version = "1.0", features = ["full"] }
+# Only the pieces used directly: `#[tokio::main]`/`tokio::pin!` (macros),
+# the multi-threaded runtime and `spawn_blocking` (rt-multi-thread, which implies rt),
+# `RwLock`/`Notify` (sync) and `sleep`/`Instant`/`timeout_at` (time).
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -33,4 +36,26 @@ log = "0.4"
 # Cross-platform keyboard & mouse input simulation (WASD movement, mouse control)
 enigo = "0.6"
 
+# RNG for the WindMouse cursor-path simulation (jittered step forces and timing)
+rand = "0.9"
+
 input-simulator = { git = "https://github.com/artwend/input-simulator", optional = true }
+
+# The capture thread runs a tight per-frame loop (staging map, downsample, pixel
+# repack) on every compositor update. An unoptimized build executes that loop
+# roughly 50x slower and pins a core, so the binary the MCP client launches must
+# always be the release build. These settings widen cross-crate inlining into the
+# capture pipeline, which is where the remaining per-frame cost lives.
+[profile.release]
+codegen-units = 1
+lto = true
+
+# Profiling build (`cargo build --profile profiling`, driven by scripts/profile.ps1):
+# release semantics plus full debug info so samply can resolve Rust frames to
+# functions and lines. Thin LTO instead of fat LTO because fat LTO drops frames
+# into LLVM-generated code with poorer attribution, and the extra build time is
+# paid on every profiling iteration.
+[profile.profiling]
+inherits = "release"
+debug = 2
+lto = "thin"

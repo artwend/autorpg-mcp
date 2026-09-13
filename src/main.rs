@@ -8,6 +8,7 @@ mod games;
 mod input;
 mod server;
 mod state;
+mod windmouse;
 
 use std::sync::Arc;
 
@@ -250,7 +251,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_notify,
         input,
         config.server,
-        config.capture.sanitized_preview_edge(),
         config.capture.sanitized_jpeg_quality(),
         instructions_path,
     );

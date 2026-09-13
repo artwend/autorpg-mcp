@@ -193,6 +193,8 @@ impl CaptureReceiver {
             rgb: std::mem::take(&mut self.rgb_scratch),
             width: preview_width,
             height: preview_height,
+            source_width,
+            source_height,
             hash: frame_hash,
         };
 

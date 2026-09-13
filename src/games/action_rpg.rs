@@ -20,6 +20,9 @@ const BAR_RIGHT: f32 = 1160.0;
 const HEALTH_BAR_Y: f32 = 960.0;
 const STAMINA_BAR_Y: f32 = 952.0;
 
+/// Vertical center of the weapon ability icons, in 1920x1080 design pixels.
+const ABILITY_BAR_Y: f32 = 960.0;
+
 /// Weapon ability icons along the bottom right, in 1920x1080 design pixels.
 const Q_ICON_X: f32 = 1685.0;
 const R_ICON_X: f32 = 1745.0;
@@ -29,7 +32,11 @@ const F_ICON_X: f32 = 1805.0;
 const ABILITY_READY_LUMINANCE: f32 = 65.0;
 
 /// Telemetry returned when a bar cannot be measured (no readable pixels).
-const UNKNOWN_PERCENT: i32 = 100;
+///
+/// Deliberately negative: a failed scan must never read as 100%, or the farming loop
+/// would keep fighting with a full health bar it never re-checks. The server renders
+/// negative values as `?` in the telemetry text.
+const UNKNOWN_PERCENT: i32 = -1;
 
 /// Action RPG telemetry profile.
 ///
@@ -48,6 +55,7 @@ pub struct ActionRPG {
     bar_right: u32,
     health_bar_y: u32,
     stamina_bar_y: u32,
+    ability_icon_y: u32,
     q_icon_x: u32,
     r_icon_x: u32,
     f_icon_x: u32,
@@ -82,6 +90,7 @@ impl ActionRPG {
             bar_right: fx(BAR_RIGHT),
             health_bar_y: fy(HEALTH_BAR_Y),
             stamina_bar_y: fy(STAMINA_BAR_Y),
+            ability_icon_y: fy(ABILITY_BAR_Y),
             q_icon_x: fx(Q_ICON_X),
             r_icon_x: fx(R_ICON_X),
             f_icon_x: fx(F_ICON_X),
@@ -169,7 +178,7 @@ impl GameProfile for ActionRPG {
         );
 
         // 3. Scan Skill Cooldown Pixels (Bottom-right weapon ability icons)
-        let ability_y = self.scale_y(self.health_bar_y, resolution);
+        let ability_y = self.scale_y(self.ability_icon_y, resolution);
         let q_ready = Self::is_ability_ready(pixels, self.scale_x(self.q_icon_x, resolution), ability_y);
         let r_ready = Self::is_ability_ready(pixels, self.scale_x(self.r_icon_x, resolution), ability_y);
         let f_ready = Self::is_ability_ready(pixels, self.scale_x(self.f_icon_x, resolution), ability_y);

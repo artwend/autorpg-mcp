@@ -79,6 +79,12 @@ pub struct FramePayload {
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
+    /// Native pixel size of the captured source (monitor or window) before the preview
+    /// downscale. Absolute image-space mouse coordinates are scaled up with these
+    /// dimensions; using the source rather than the display keeps the mapping correct
+    /// when a single window is captured.
+    pub source_width: u32,
+    pub source_height: u32,
     /// Average hash of the preview, computed by the capture thread at publish time.
     pub hash: u64,
 }
