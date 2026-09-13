@@ -86,7 +86,7 @@ Register the release binary as a stdio server. Example for a VS Code MCP configu
   "servers": {
     "autorpg": {
       "type": "stdio",
-      "command": "D:\\projects\\gamedev\\autorpg-mcp\\target\\release\\autorpg-mcp.exe",
+      "command": "path_to_your\\autorpg-mcp.exe",
       "args": []
     }
   }
