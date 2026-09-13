@@ -1,12 +1,14 @@
 //! In-memory session state shared between the MCP tools and the capture thread.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, RwLock};
 
+use enigo::Button;
 use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
 
 use crate::games::GameProfile;
@@ -19,6 +21,7 @@ pub struct GameMetrics {
     pub q_ready: bool,
     pub r_ready: bool,
     pub f_ready: bool,
+    pub g_ready: bool,
     // pub action_availability: std::collections::HashMap<String, bool>,
     pub location: String,
     pub in_combat: bool,
@@ -33,7 +36,9 @@ pub struct SessionEvent {
 }
 
 /// Full session state: current metrics plus the event history.
-#[derive(Clone)]
+///
+/// Deliberately not `Clone`: it lives behind an `Arc<RwLock<...>>` and copying it would
+/// deep-copy the whole event history for no caller.
 pub struct SessionState {
     pub current_metrics: GameMetrics,
     pub active_game: Arc<dyn GameProfile>,
@@ -67,13 +72,63 @@ impl SessionState {
 /// Thread-safe pointer for state management (async readers/writers).
 pub type SharedSession = Arc<RwLock<SessionState>>;
 
+/// Mouse buttons currently held down through `hold_mouse`.
+///
+/// Tracked for two reasons: a second press of an already-held button is rejected instead
+/// of silently stacking, and whatever is still held when the session ends is released
+/// rather than left stuck down in the OS input state.
+///
+/// Uses a `std::sync::Mutex` rather than the async session lock so the release path can
+/// also run from a synchronous `Drop`, where no async context is available.
+#[derive(Default)]
+pub struct HeldButtons(Mutex<Vec<Button>>);
+
+impl HeldButtons {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Button>> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Records `button` as held, returning `false` when it already was.
+    ///
+    /// The check and the insert share one lock acquisition, so two concurrent presses of
+    /// the same button cannot both succeed.
+    pub fn press(&self, button: Button) -> bool {
+        let mut held = self.lock();
+        if held.contains(&button) {
+            return false;
+        }
+        held.push(button);
+        true
+    }
+
+    /// Clears `button` from the held set, returning whether it had been recorded.
+    pub fn release(&self, button: Button) -> bool {
+        let mut held = self.lock();
+        match held.iter().position(|&held| held == button) {
+            Some(index) => {
+                held.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes and returns every held button, so the caller can release them.
+    pub fn take_all(&self) -> Vec<Button> {
+        std::mem::take(&mut self.lock())
+    }
+}
+
+/// Thread-safe pointer to the set of mouse buttons held by `hold_mouse`.
+pub type SharedHeldButtons = Arc<HeldButtons>;
+
 /// Latest captured frame shared between the capture thread and the MCP tools.
 ///
 /// The preview pixels travel with their hash so the tools can read telemetry straight out
 /// of the frame the capture thread already produced once, instead of re-encoding or
 /// re-decoding anything on every call. JPEG encoding is deferred to the consumer: the
 /// capture thread never pays for it while no MCP client is querying frames.
-#[derive(Default, Debug)]
+#[derive(Default)]
 pub struct FramePayload {
     /// Tightly packed RGB8 pixels of the preview.
     pub rgb: Vec<u8>,
@@ -168,8 +223,123 @@ impl RgbView<'_> {
     }
 }
 
+/// Outcome of a non-blocking attempt to read the latest published frame.
+enum FrameLock {
+    /// The lock was acquired and held a frame.
+    Frame(Arc<FramePayload>),
+    /// The lock was acquired and no frame has been published yet.
+    Empty,
+    /// Another thread (the capture thread) held the lock.
+    Contended,
+}
+
+impl FrameLock {
+    fn from_option(frame: Option<&Arc<FramePayload>>) -> Self {
+        match frame {
+            Some(frame) => Self::Frame(Arc::clone(frame)),
+            None => Self::Empty,
+        }
+    }
+}
+
+/// Shared buffer holding the latest captured frame.
+///
+/// The payload sits behind its own `Arc` so a consumer can clone the handle and release
+/// the mutex before doing per-call image work (telemetry parsing, JPEG encoding), instead
+/// of blocking the capture thread's next publish behind it. The wrapper hides the lock
+/// (including poisoned-lock recovery) from every call site.
+#[derive(Default)]
+pub struct FrameBuffer {
+    latest: Mutex<Option<Arc<FramePayload>>>,
+    /// Set once the capture session has ended. Distinguishes "the capture stopped" from
+    /// "the capture has not produced a frame yet", which are otherwise both an empty slot.
+    closed: AtomicBool,
+}
+
+impl FrameBuffer {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<FramePayload>>> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Clones the handle to the latest published frame, if any.
+    ///
+    /// Returns `None` while the capture thread has not produced a frame yet, or after the
+    /// capture session has closed. Blocking; call from a blocking thread or use
+    /// [`FrameBuffer::latest_async`].
+    pub fn latest(&self) -> Option<Arc<FramePayload>> {
+        self.lock().as_ref().map(Arc::clone)
+    }
+
+    /// Async-friendly clone of the latest published frame handle.
+    ///
+    /// A blocking `std` mutex taken directly in an async fn parks the executor thread when
+    /// the capture thread happens to be mid-publish. Both sides hold the lock only for a
+    /// pointer swap or an `Arc` clone, so the non-blocking fast path virtually always
+    /// succeeds; the rare contended case is offloaded to a blocking thread instead of
+    /// stalling the runtime.
+    pub async fn latest_async(self: &Arc<Self>) -> Option<Arc<FramePayload>> {
+        match self.try_latest() {
+            FrameLock::Frame(frame) => Some(frame),
+            FrameLock::Empty => None,
+            FrameLock::Contended => {
+                let buffer = Arc::clone(self);
+                tokio::task::spawn_blocking(move || buffer.latest())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        }
+    }
+
+    /// Non-blocking [`FrameBuffer::latest`].
+    ///
+    /// Kept as a separate synchronous helper (rather than inlined into
+    /// [`FrameBuffer::latest_async`]) so no `MutexGuard` is ever alive across an await
+    /// point, which would make the async fn's future `!Send`.
+    fn try_latest(&self) -> FrameLock {
+        match self.latest.try_lock() {
+            Ok(guard) => FrameLock::from_option(guard.as_ref()),
+            Err(TryLockError::Poisoned(poisoned)) => {
+                FrameLock::from_option(poisoned.into_inner().as_ref())
+            }
+            Err(TryLockError::WouldBlock) => FrameLock::Contended,
+        }
+    }
+
+    /// Publishes a new frame, returning the previous one.
+    ///
+    /// The publisher can reclaim the previous frame's pixel allocation via
+    /// [`Arc::try_unwrap`] once no consumer still holds a clone.
+    pub fn publish(&self, payload: Arc<FramePayload>) -> Option<Arc<FramePayload>> {
+        let previous = self.lock().replace(payload);
+        // Only the capture thread calls this, immediately after `new`, so a publish can
+        // never race a close in practice; clearing it here keeps the state coherent if the
+        // capture is ever restarted in-process.
+        self.closed.store(false, Ordering::Release);
+        previous
+    }
+
+    /// Marks the capture session as ended, dropping the published frame.
+    ///
+    /// Called from the capture handler's `on_closed`. Clearing the frame means consumers
+    /// report "no active display buffer" instead of repeatedly serving a frozen image from
+    /// a capture that is no longer running, and [`FrameBuffer::is_closed`] lets a waiter
+    /// stop blocking on a notification that can never fire again.
+    pub fn close(&self) {
+        self.lock().take();
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the capture session has ended without being restarted.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
 /// Thread-safe pointer to the latest captured frame.
-pub type SharedFrameBuffer = Arc<Mutex<Option<FramePayload>>>;
+pub type SharedFrameBuffer = Arc<FrameBuffer>;
 
 /// Event signal fired by the capture thread after every published frame.
 ///
@@ -183,4 +353,43 @@ pub fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn press_is_rejected_while_the_button_is_held() {
+        let held = HeldButtons::default();
+        assert!(held.press(Button::Right));
+        assert!(!held.press(Button::Right), "double press must be rejected");
+        assert!(held.press(Button::Left), "other buttons stay independent");
+    }
+
+    #[test]
+    fn release_clears_only_the_named_button() {
+        let held = HeldButtons::default();
+        held.press(Button::Left);
+        held.press(Button::Middle);
+
+        assert!(held.release(Button::Left));
+        assert!(!held.release(Button::Left), "a second release is a no-op");
+        assert_eq!(held.take_all(), vec![Button::Middle]);
+    }
+
+    #[test]
+    fn take_all_drains_the_set() {
+        let held = HeldButtons::default();
+        held.press(Button::Left);
+        held.press(Button::Right);
+
+        let mut taken = held.take_all();
+        taken.sort_by_key(|button| format!("{button:?}"));
+        assert_eq!(taken, vec![Button::Left, Button::Right]);
+        assert!(
+            held.take_all().is_empty(),
+            "a second drain must release nothing twice"
+        );
+    }
 }

@@ -10,7 +10,7 @@
 //! algorithm; [`generate_path`] is a pure function so the simulation can be tested
 //! without touching the input backend.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use enigo::{Coordinate, InputError, Mouse};
 use rand::Rng;
@@ -71,6 +71,15 @@ pub const MOUSE_POLL_INTERVAL: Duration = Duration::from_millis(8);
 /// Upper bound on simulated steps, so a degenerate force state can never spin
 /// forever. Far beyond the step count any real screen distance needs.
 const MAX_STEPS: usize = 4096;
+
+/// Wall-clock budget for a single [`move_to`] call.
+///
+/// The caller holds the input mutex for the whole move, so an unbounded path would block
+/// every other input tool behind it. [`MAX_STEPS`] alone allows ~40 s at the poll
+/// interval; this caps a move at a few seconds, which is far longer than any real
+/// full-screen move needs. When the budget runs out the cursor is closed onto the
+/// destination in one final step.
+pub const MAX_MOVE_DURATION: Duration = Duration::from_secs(3);
 
 /// The simulation ends this close (in pixels) to the destination.
 const ARRIVAL_RADIUS: f64 = 1.0;
@@ -162,18 +171,35 @@ pub fn generate_path(start: Point, dest: Point, params: WindMouseParams) -> Vec<
 /// The current position is read from `input`, so callers need not track it.
 /// Returns the number of interpolation steps sent (0 if the cursor was already
 /// at `dest`). Blocking: call from a blocking thread.
+///
+/// The move is bounded by [`MAX_MOVE_DURATION`]: the caller holds the input mutex for its
+/// whole duration, so the loop stops early once the budget is spent and closes the
+/// remaining distance in one final step.
 pub fn move_to<I: Mouse + ?Sized>(input: &mut I, dest: Point) -> Result<usize, InputError> {
     let (x, y) = input.location()?;
     let path = generate_path(Point::new(x, y), dest, WindMouseParams::randomized());
 
+    let deadline = Instant::now() + MAX_MOVE_DURATION;
     let mut rng = rand::rng();
+    let mut steps = 0;
     for point in &path {
+        if Instant::now() >= deadline {
+            break;
+        }
         // Jitter each interval so the update cadence is not a perfect metronome.
         std::thread::sleep(MOUSE_POLL_INTERVAL + Duration::from_millis(rng.random_range(0..=4)));
         input.move_mouse(point.x, point.y, Coordinate::Abs)?;
+        steps += 1;
     }
 
-    Ok(path.len())
+    // The budget may have cut the path short; land exactly on the destination so callers
+    // can rely on the cursor being where they asked.
+    if steps < path.len() {
+        input.move_mouse(dest.x, dest.y, Coordinate::Abs)?;
+        steps += 1;
+    }
+
+    Ok(steps)
 }
 
 #[cfg(test)]

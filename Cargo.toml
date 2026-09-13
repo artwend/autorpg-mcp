@@ -33,6 +33,10 @@ windows-capture = "2.0"
 # Logging facade; the capture thread reports transient frame errors through it.
 log = "0.4"
 
+# Logger backend for the `log` facade. Writes to stderr, because stdout carries the
+# JSON-RPC stream. Level is controlled by the RUST_LOG environment variable.
+env_logger = "0.11"
+
 # Cross-platform keyboard & mouse input simulation (WASD movement, mouse control)
 enigo = "0.6"
 

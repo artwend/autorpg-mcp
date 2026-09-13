@@ -1,6 +1,7 @@
 //! Windows Graphics Capture engine: streams the primary monitor (or the window
 //! named in the configuration) into a shared RGB preview buffer.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fast_image_resize::{
@@ -128,7 +129,27 @@ impl GraphicsCaptureApiHandler for CaptureReceiver {
         Ok(())
     }
 
+    /// Handles the capture session ending.
+    ///
+    /// The compositor item is gone (the captured window was closed, the monitor was
+    /// disconnected) or Windows revoked it, so no further `on_frame_arrived` callback will
+    /// arrive. Two things follow from that:
+    ///
+    /// - Consumers parked in `wait_for_screen_change` must be woken here, or they would sit
+    ///   out the full wait timeout on a notification that can never fire again.
+    /// - The published frame is cleared so `capture_screen` reports "no active display
+    ///   buffer" instead of repeatedly serving a frozen image from a capture that has
+    ///   stopped.
+    ///
+    /// The stop is logged at `warn!` rather than passed silently: this is the only signal
+    /// that the capture pipeline is dead until the server is restarted.
     fn on_closed(&mut self) -> Result<(), Self::Error> {
+        warn!(
+            "capture session closed: no further frames will be published until the server \
+             is restarted"
+        );
+        self.frame_buffer.close();
+        self.frame_notify.notify_waiters();
         Ok(())
     }
 }
@@ -156,6 +177,14 @@ impl CaptureReceiver {
             // tightly packed, so it only fills `depad_scratch` when the GPU added padding.
             let pixels = buffer.as_nopadding_buffer(&mut self.depad_scratch);
             if pixels.len() < expected_len {
+                // A short buffer means the mapped texture did not match the frame's
+                // reported dimensions. Log it like any other transient failure instead of
+                // dropping the frame silently.
+                warn!(
+                    "skipping captured frame: mapped buffer is {} bytes, expected {expected_len} \
+                     for {source_width}x{source_height}",
+                    pixels.len()
+                );
                 return Ok(());
             }
 
@@ -187,26 +216,23 @@ impl CaptureReceiver {
         let frame_hash = average_hash(&self.rgb_scratch, preview_width, preview_height);
 
         // Publish the new payload while reclaiming the previous frame's allocation. The
-        // scratch buffer is handed to `payload` below, so taking the old frame's buffer
-        // back is what keeps it on a single allocation.
-        let payload = FramePayload {
+        // scratch buffer is handed to `payload` above, so taking the old frame's buffer
+        // back is what keeps it on a single allocation. The payload is shared behind an
+        // `Arc`, so the buffer can only be reclaimed when no consumer still holds a clone;
+        // otherwise the allocation is dropped and a fresh one is grown next frame.
+        let payload = Arc::new(FramePayload {
             rgb: std::mem::take(&mut self.rgb_scratch),
             width: preview_width,
             height: preview_height,
             source_width,
             source_height,
             hash: frame_hash,
-        };
-
-        let mut published = match self.frame_buffer.lock() {
-            Ok(lock) => lock,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(previous) = published.take() {
+        });
+        if let Some(previous) = self.frame_buffer.publish(payload)
+            && let Ok(previous) = Arc::try_unwrap(previous)
+        {
             self.rgb_scratch = previous.rgb;
         }
-        *published = Some(payload);
-        drop(published);
 
         // Wake any consumer blocked in `wait_for_screen_change` now that a fresh frame
         // is visible. `notify_waiters` pairs with the `Notified::enable` registration the

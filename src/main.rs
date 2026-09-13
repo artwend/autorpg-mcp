@@ -1,5 +1,6 @@
 //! autorpg-mcp: an MCP server exposing screen capture, input simulation and
 //! game-state tracking tools for game automation.
+// #![windows_subsystem = "windows"]
 
 mod capture;
 mod config;
@@ -25,11 +26,17 @@ use windows_capture::{
     },
     window::Window,
 };
+// use windows::{
+//     Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole},
+//     core::Result,
+// };
 
 use capture::{CaptureFlags, CaptureReceiver};
 use config::{Config, CONFIG_PATH_ENV, DEFAULT_CONFIG_PATH};
 use server::GameServer;
-use state::{GameMetrics, SessionState, SharedFrameBuffer, SharedFrameNotify};
+use state::{
+    GameMetrics, SessionState, SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons,
+};
 
 // Per-monitor-v2 DPI awareness so `GetSystemMetrics` (and therefore the input
 // backend's `main_display`) reports physical monitor pixels instead of
@@ -127,6 +134,15 @@ fn capture_window_by_title(title: &str) -> Result<Window, Box<dyn std::error::Er
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // unsafe {
+    //     AttachConsole(ATTACH_PARENT_PROCESS)?;
+    // }
+
+    // Install the logger before anything can log. `env_logger` writes to stderr, keeping
+    // stdout clean for the JSON-RPC stream; the level comes from RUST_LOG (default: warn,
+    // so transient capture errors are still reported without a flood of info lines).
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     set_process_dpi_awareness();
 
     // Load the configuration file. An explicit CLI argument or the AUTORPG_MCP_CONFIG
@@ -177,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             q_ready: true,
             r_ready: true,
             f_ready: true,
+            g_ready: true,
             location: config.session.initial_location.clone(),
             in_combat: false,
         },
@@ -193,6 +210,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // thread fires after every published frame so waiters wake immediately.
     let frame_buffer: SharedFrameBuffer = Default::default();
     let frame_notify: SharedFrameNotify = Default::default();
+
+    // Buttons held down by `hold_mouse`, tracked so a double press is rejected and
+    // anything still held when the session ends is released instead of left stuck down.
+    let held_buttons: SharedHeldButtons = Default::default();
 
     // Start the Windows Graphics Capture session on a dedicated background thread.
     //
@@ -250,13 +271,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         frame_buffer,
         frame_notify,
         input,
+        held_buttons,
         config.server,
         config.capture.sanitized_jpeg_quality(),
         instructions_path,
     );
     let service = server.serve(rmcp::transport::stdio()).await?;
 
-    // Block until the client disconnects
+    // Block until the client disconnects. `waiting` consumes the service, so its server
+    // (and with it `GameServer`'s `Drop`) is torn down right here: no tool call can arrive
+    // any more, and the drop releases a mouse button left held by an unmatched
+    // `hold_mouse` press before the input simulator goes away.
     service.waiting().await?;
     Ok(())
 }

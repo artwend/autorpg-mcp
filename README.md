@@ -116,10 +116,11 @@ The server logs to stderr; stdout carries the JSON-RPC stream.
 `capture_screen` returns server-parsed telemetry with every frame:
 
 ```
-[HP: X% | Stamina: Y% | Q: READY/COOLDOWN | R: ... | F: ... | Zone: Name]
+[HP: X% | Stamina: Y% | Q: READY/COOLDOWN | R: ... | F: ... | G: ... | Combat: IN/OUT | Zone: Name]
 ```
 
-Combat stats and weapon cooldowns are maintained automatically. If a bar cannot be measured,
+Combat stats, weapon cooldowns and the crossed-swords combat flag are maintained
+automatically. If a bar cannot be measured,
 HP or Stamina is reported as `?` instead of a number, so a failed scan never reads as full
 health.
 

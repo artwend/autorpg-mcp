@@ -17,10 +17,11 @@ use crate::config::ServerConfig;
 use crate::error::{input_error, internal_error, invalid_params};
 use crate::games::Resolution;
 use crate::input::{direction_scancode, key_scancode, ops};
-use crate::state::{SharedFrameBuffer, SharedFrameNotify, SharedSession};
+use crate::state::{
+    SharedFrameBuffer, SharedFrameNotify, SharedHeldButtons, SharedSession,
+};
 use crate::windmouse;
 /// Application context shared by all MCP tools.
-#[derive(Clone)]
 pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     session: SharedSession,
     frame_buffer: SharedFrameBuffer,
@@ -28,6 +29,8 @@ pub struct GameServer<Input: Keyboard + Mouse + Send + 'static> {
     /// wait-for-change loop sleep until a frame actually lands instead of polling.
     frame_notify: SharedFrameNotify,
     input: Arc<Mutex<Input>>,
+    /// Mouse buttons currently held down via `hold_mouse`.
+    held_buttons: SharedHeldButtons,
     /// Tool limits loaded from the configuration file.
     limits: ServerConfig,
     /// Quality of the on-demand JPEG encode, from the capture configuration.
@@ -141,6 +144,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         frame_buffer: SharedFrameBuffer,
         frame_notify: SharedFrameNotify,
         input: Input,
+        held_buttons: SharedHeldButtons,
         limits: ServerConfig,
         jpeg_quality: u8,
         instructions_path: std::path::PathBuf,
@@ -150,6 +154,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             frame_buffer,
             frame_notify,
             input: Arc::new(Mutex::new(input)),
+            held_buttons,
             limits,
             jpeg_quality,
             instructions_path,
@@ -177,66 +182,61 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         // be held across the await below.
         let mut session = self.session.write().await;
 
-        // Everything read out of the frame happens under one short critical section: sparse
-        // telemetry pixel samples and the on-demand JPEG encode. No base64 encoding runs
-        // under the lock, so the capture thread's `on_frame_arrived` is never blocked behind
-        // per-call image work.
-        let (telemetry, jpeg) = {
-            let guard = match self.frame_buffer.lock() {
-                Ok(lock) => lock,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let Some(frame) = guard.as_ref() else {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "No active display buffer detected yet. Try again.",
-                )]));
-            };
-
-            let Some(pixels) = frame.as_rgb_view() else {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "Published display frame is malformed. Try again.",
-                )]));
-            };
-            let resolution = Resolution::new(frame.width, frame.height);
-            let mut metrics = session.active_game.parse_telemetry(&pixels, resolution);
-            // Zone is MCP-managed via `update_game_metrics`; pixel parsing cannot read it,
-            // so carry the session's location forward instead of dropping it.
-            metrics.location = session.current_metrics.location.clone();
-            // Persist parsed telemetry so `get_game_metrics` and `record_event` snapshots
-            // reflect the live frame instead of stale initialization data.
-            session.current_metrics = metrics.clone();
-            // Only record the frame hash when the screen actually changed: overwriting it
-            // during a timed-out (static) check would make every subsequent call re-poll
-            // against the identical hash and time out forever until something else moves
-            // the display.
-            if !timed_out {
-                session.last_frame_hash = Some(frame.hash);
-            }
-
-            // The JPEG is encoded on demand (the capture thread no longer pre-encodes) and
-            // handed out so the lock can be dropped before the base64 encode below. A
-            // timed-out (static) capture returns no image, so skip the encode entirely
-            // instead of paying for it under the locks only to discard the result.
-            let jpeg = if timed_out {
-                None
-            } else {
-                Some(
-                    frame
-                        .encode_jpeg(self.jpeg_quality)
-                        .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?,
-                )
-            };
-            (metrics, jpeg)
+        // Take a shared handle to the latest frame and release the frame mutex immediately:
+        // telemetry parsing and the on-demand JPEG encode below are per-call image work and
+        // must not block the capture thread's next publish behind them. The read is
+        // async-friendly so a contended lock never parks the executor thread.
+        let Some(frame) = self.frame_buffer.latest_async().await else {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "No active display buffer detected yet. Try again.",
+            )]));
         };
 
-        let metrics = telemetry;
+        let Some(pixels) = frame.as_rgb_view() else {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "Published display frame is malformed. Try again.",
+            )]));
+        };
+        let resolution = Resolution::new(frame.width, frame.height);
+        let mut metrics = session.active_game.parse_telemetry(&pixels, resolution);
+        // Zone is MCP-managed via `update_game_metrics`; pixel parsing cannot read it,
+        // so carry the session's location forward instead of dropping it.
+        metrics.location = session.current_metrics.location.clone();
+        // Persist parsed telemetry so `get_game_metrics` and `record_event` snapshots
+        // reflect the live frame instead of stale initialization data.
+        session.current_metrics = metrics.clone();
+        // Only record the frame hash when the screen actually changed: overwriting it
+        // during a timed-out (static) check would make every subsequent call re-poll
+        // against the identical hash and time out forever until something else moves
+        // the display.
+        if !timed_out {
+            session.last_frame_hash = Some(frame.hash);
+        }
+
+        // The JPEG is encoded on demand (the capture thread no longer pre-encodes). A
+        // timed-out (static) capture returns no image, so skip the encode entirely
+        // instead of paying for it only to discard the result.
+        let jpeg = if timed_out {
+            None
+        } else {
+            Some(
+                frame
+                    .encode_jpeg(self.jpeg_quality)
+                    .map_err(|error| internal_error(format!("failed to encode preview: {error}")))?,
+            )
+        };
+        drop(session);
+
+        let combat_text = if metrics.in_combat { "IN" } else { "OUT" };
         let telemetry_text = format!(
-            "[HP: {} | Stamina: {} | Q: {} | R: {} | F: {} | Zone: {}]",
+            "[HP: {} | Stamina: {} | Q: {} | R: {} | F: {} | G: {} | Combat: {} | Zone: {}]",
             Self::format_percent(metrics.player_hp),
             Self::format_percent(metrics.stamina),
             Self::format_ability(metrics.q_ready),
             Self::format_ability(metrics.r_ready),
             Self::format_ability(metrics.f_ready),
+            Self::format_ability(metrics.g_ready),
+            combat_text,
             if metrics.location.is_empty() {
                 "Unknown"
             } else {
@@ -464,12 +464,10 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             1.0
         } else {
             // Frame lock only, never held across an await: the closure below runs on a
-            // blocking thread.
-            let guard = match self.frame_buffer.lock() {
-                Ok(lock) => lock,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let frame = guard.as_ref().ok_or_else(|| {
+            // blocking thread. Only the dimensions are read, so the lock is released
+            // before the move is dispatched. The read is async-friendly so a contended
+            // lock never parks the executor thread.
+            let frame = self.frame_buffer.latest_async().await.ok_or_else(|| {
                 invalid_params("No frame captured yet; call capture_screen first.")
             })?;
             let preview_longest = frame.width.max(frame.height) as f64;
@@ -555,23 +553,13 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         let button = parse_button(button.as_deref())?;
         let double = double.unwrap_or(false);
 
-        let input = Arc::clone(&self.input);
-        tokio::task::spawn_blocking(move || -> Result<(), String> {
-            let mut simulator = input.lock().map_err(|e| e.to_string())?;
-            simulator
-                .button(button, Direction::Click)
-                .map_err(|e| e.to_string())?;
-            if double {
-                std::thread::sleep(Duration::from_millis(50));
-                simulator
-                    .button(button, Direction::Click)
-                    .map_err(|e| e.to_string())?;
-            }
-            Ok(())
-        })
-        .await
-        .map_err(input_error)?
-        .map_err(input_error)?;
+        // The gap between the two clicks is waited on asynchronously, outside the input
+        // mutex, so a double click does not block other input tools for the duration.
+        self.click_once(button).await?;
+        if double {
+            tokio::time::sleep(DOUBLE_CLICK_GAP).await;
+            self.click_once(button).await?;
+        }
 
         let message = format!(
             "{} {:?} mouse button clicked.",
@@ -600,14 +588,39 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
     ) -> Result<CallToolResult, McpError> {
         let button = parse_button(button.as_deref())?;
         let action = parse_hold_action(action.as_deref())?;
-        let duration =
-            Duration::from_millis(duration_ms.unwrap_or(50).min(self.limits.max_hold_ms));
+        // Only "hold" consumes a duration: it presses, waits, then releases. A bare press
+        // or release is a single event, so `duration_ms` is ignored for those instead of
+        // being clamped and carried through unused.
+        let hold_duration = match action {
+            HoldAction::Hold => Some(Duration::from_millis(
+                duration_ms.unwrap_or(50).min(self.limits.max_hold_ms),
+            )),
+            HoldAction::Press | HoldAction::Release => None,
+        };
+
+        // Track what `press`/`hold` leaves down so a double press can be rejected and a
+        // button still held when the session ends can be released.
+        match action {
+            HoldAction::Press => {
+                if !self.held_buttons.press(button) {
+                    return Err(invalid_params(format!(
+                        "The {button:?} mouse button is already held down; release it before pressing again."
+                    )));
+                }
+            }
+            HoldAction::Release | HoldAction::Hold => {
+                // `hold` releases itself below, so it must not leave itself marked as held
+                // on failure; both are simple clears when nothing was recorded.
+                self.held_buttons.release(button);
+            }
+        }
 
         let input = Arc::clone(&self.input);
         tokio::task::spawn_blocking(move || -> Result<(), String> {
             let mut simulator = input.lock().map_err(|e| e.to_string())?;
             match action {
                 HoldAction::Hold => {
+                    let duration = hold_duration.ok_or("hold action requires a duration")?;
                     simulator
                         .button(button, Direction::Press)
                         .map_err(|e| e.to_string())?;
@@ -625,17 +638,28 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             }
         })
         .await
-        .map_err(input_error)?
-        .map_err(input_error)?;
+        .map_err(input_error)
+        .and_then(|result| result.map_err(input_error))
+        .inspect_err(|_| {
+            // A failed press must not leave the button marked as held, or the matching
+            // release would be rejected as "not held" later.
+            if action == HoldAction::Press {
+                self.held_buttons.release(button);
+            }
+        })?;
 
-        let message = match action {
-            HoldAction::Hold => format!(
+        let message = match (action, hold_duration) {
+            (HoldAction::Hold, Some(duration)) => format!(
                 "Held {:?} mouse button for {} ms, then released.",
                 button,
                 duration.as_millis()
             ),
-            HoldAction::Press => format!("Mouse button {button:?} pressed (held down)."),
-            HoldAction::Release => format!("Mouse button {button:?} released."),
+            (HoldAction::Press, _) => format!(
+                "Mouse button {button:?} pressed (held down). Release it with hold_mouse action 'release'."
+            ),
+            (HoldAction::Release, _) => format!("Mouse button {button:?} released."),
+            // `Hold` always carries a duration by construction above.
+            (HoldAction::Hold, None) => unreachable!(),
         };
         self.session.write().await.record_event(message.clone());
 
@@ -659,10 +683,19 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         .map_err(input_error)?
         .map_err(input_error)?;
 
+        // `unsigned_abs` instead of `abs`, which panics on `i32::MIN` (the negation
+        // overflows). Zero is neither up nor down, so it gets its own wording rather than
+        // being reported as an upward scroll.
         let message = format!(
             "Scrolled {} clicks {}.",
-            amount.abs(),
-            if amount >= 0 { "up" } else { "down" }
+            amount.unsigned_abs(),
+            if amount == 0 {
+                "(no movement)"
+            } else if amount > 0 {
+                "up"
+            } else {
+                "down"
+            }
         );
         self.session.write().await.record_event(message.clone());
 
@@ -702,6 +735,9 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
         Ok(CallToolResult::success(vec![ContentBlock::text(message)]))
     }
 }
+
+/// Gap inserted between the two clicks of a double click.
+const DOUBLE_CLICK_GAP: Duration = Duration::from_millis(50);
 
 /// Parses a tool's button name argument into the enigo `Button`.
 fn parse_button(button: Option<&str>) -> Result<Button, McpError> {
@@ -763,6 +799,48 @@ fn parse_hold_action(action: Option<&str>) -> Result<HoldAction, McpError> {
 type MouseMoveResult = Result<((i32, i32), (i32, i32), usize), String>;
 
 impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
+    /// Dispatches a single press-and-release of `button`.
+    ///
+    /// Split out of `click_mouse` so the double-click gap is awaited in the async handler
+    /// rather than slept through inside the blocking task, which would hold the input
+    /// mutex for the whole gap.
+    async fn click_once(&self, button: Button) -> Result<(), McpError> {
+        let input = Arc::clone(&self.input);
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let mut simulator = input.lock().map_err(|e| e.to_string())?;
+            simulator
+                .button(button, Direction::Click)
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(input_error)?
+        .map_err(input_error)
+    }
+    /// Releases every mouse button `hold_mouse` left held down.
+    ///
+    /// Called once the MCP client disconnects, and again from [`Drop`] as a backstop, so a
+    /// session that ends between a `press` and its matching `release` never leaves a
+    /// button stuck down in the OS input state. Idempotent: the held set is drained before
+    /// the release events are sent, so a second call is a no-op.
+    pub fn release_held_buttons(&self) {
+        let held = self.held_buttons.take_all();
+        if held.is_empty() {
+            return;
+        }
+
+        let mut simulator = match self.input.lock() {
+            Ok(lock) => lock,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for button in held {
+            match simulator.button(button, Direction::Release) {
+                Ok(()) => log::info!("released {button:?} mouse button still held at shutdown"),
+                Err(error) => {
+                    log::warn!("failed to release {button:?} mouse button at shutdown: {error}")
+                }
+            }
+        }
+    }
     /// Waits until the screen visibly changes or the wait times out.
     ///
     /// Returns `true` if the wait timed out with the screen still static.
@@ -786,11 +864,7 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             let changed = {
                 let session = self.session.read().await;
                 let last_hash = session.last_frame_hash;
-                let guard = match self.frame_buffer.lock() {
-                    Ok(lock) => lock,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                match guard.as_ref() {
+                match self.frame_buffer.latest_async().await {
                     // No buffer published yet; keep waiting.
                     None => false,
                     Some(frame) => last_hash.is_none_or(|last| {
@@ -801,6 +875,13 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
             };
             if changed {
                 return Ok(false);
+            }
+            // A closed capture session will never publish again: `on_closed` cleared the
+            // buffer and woke us, and no future frame can make this loop succeed. Bail out
+            // now instead of sleeping out the remaining timeout for nothing; the caller
+            // then reports the missing buffer.
+            if self.frame_buffer.is_closed() {
+                return Ok(true);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Ok(true);
@@ -814,6 +895,18 @@ impl<Input: Keyboard + Mouse + Send + 'static> GameServer<Input> {
                 return Ok(true);
             }
         }
+    }
+}
+
+/// Backstop release of any mouse button the session left held.
+///
+/// The normal path calls [`GameServer::release_held_buttons`] after the client disconnects;
+/// this covers teardown that never reaches it (a panicking task, an early `?` return), so
+/// the desktop is never left with a button pressed. The held set is shared and drained by
+/// the release, so running twice releases nothing the second time.
+impl<Input: Keyboard + Mouse + Send + 'static> Drop for GameServer<Input> {
+    fn drop(&mut self) {
+        self.release_held_buttons();
     }
 }
 

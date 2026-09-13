@@ -7,8 +7,8 @@ Farm {target} continuously for {duration} minute(s).
 
 ## Telemetry
 `capture_screen` returns server-parsed telemetry with every frame:
-`[HP: X% | Stamina: Y% | Q: READY/COOLDOWN | R: ... | F: ... | Zone: Name]`
-All combat stats and weapon cooldowns are maintained automatically.
+`[HP: X% | Stamina: Y% | Q: READY/COOLDOWN | R: ... | F: ... | G: ... | Combat: IN/OUT | Zone: Name]`
+All combat stats, weapon cooldowns and the combat flag are maintained automatically.
 If a bar cannot be measured, HP or Stamina is reported as `?` instead of a number.
 
 ## Loop
@@ -53,3 +53,4 @@ repeatedly re-calling `capture_screen` while nothing can change yet.
 - Use `wait` instead of spamming `capture_screen` when a delay is unavoidable.
 - Stop immediately if HP reaches 0 or the session is interrupted.
 - Report a summary of kills, potions used, and final HP when done.
+- DO NOT append any polite greetings, debugging footnotes, or conversational commentary.
