@@ -20,7 +20,10 @@ serde_json = "1.0"
 
 # TOML configuration file parsing
 toml = "0.9"
-image = { version = "0.25", features = ["jpeg", "png"] }
+# Only the JPEG encoder is used (`state.rs` encodes previews to JPEG). Disabling the
+# default features avoids building the png/gif/qoi/webp/tiff/exr/ravif codecs and
+# their trees (rav1e, rayon, half, ...), which dominated dependency compile time.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 base64 = "0.22"
 
 # SIMD-accelerated image resampling (used to downscale captured frames).
@@ -48,24 +51,32 @@ input-simulator = { git = "https://github.com/artwend/input-simulator", optional
 # The capture thread runs a tight per-frame loop (staging map, downsample, pixel
 # repack) on every compositor update. An unoptimized build executes that loop
 # roughly 50x slower and pins a core, so the binary the MCP client launches must
-# always be the release build. `dev` mirrors the release settings so a plain
-# `cargo build`/`cargo run` produces release semantics (`--release` is then a
-# no-op except for directory naming).
+# always be the release build. `dev` mirrors the release semantics (opt-level 3) so a plain
+# `cargo build`/`cargo run` produces release-speed loop behavior, but uses thin LTO
+# and many codegen units: fat LTO + codegen-units=1 serialized the whole codegen
+# pipeline and doubled iteration time for no measurable loop gain.
 [profile.dev]
 opt-level = 3
-codegen-units = 1
-lto = true
+lto = "thin"
 
+# Same reasoning: thin LTO keeps cross-crate inlining of the capture loop while
+# codegen runs in parallel, cutting link/codegen time roughly in half vs fat LTO.
+# For an actually shippable, maximally optimized binary use the `dist` profile.
 [profile.release]
+lto = "thin"
+
+# Full-fat optimization for published builds (`cargo build --profile dist`).
+[profile.dist]
+inherits = "release"
 codegen-units = 1
 lto = true
 
 # Profiling build (`cargo build --profile profiling`, driven by scripts/profile.ps1):
-# release semantics plus full debug info so samply can resolve Rust frames to
-# functions and lines. Thin LTO instead of fat LTO because fat LTO drops frames
-# into LLVM-generated code with poorer attribution, and the extra build time is
+# release code (codegen-units=1 via dist) plus full debug info so samply can resolve
+# Rust frames to functions and lines. Thin LTO instead of fat LTO because fat LTO drops
+# frames into LLVM-generated code with poorer attribution, and the extra build time is
 # paid on every profiling iteration.
 [profile.profiling]
-inherits = "release"
+inherits = "dist"
 debug = 2
 lto = "thin"
